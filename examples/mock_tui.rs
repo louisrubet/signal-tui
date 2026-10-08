@@ -23,6 +23,7 @@ fn main() -> io::Result<()> {
         let Event::Key(key) = event::read()? else { continue };
         match app.handle_key(key) {
             Some(Action::Quit) => return Ok(()),
+            Some(Action::Opened(_)) => {}
             Some(Action::Send { discussion, text, reply_to }) => {
                 app.push_message(discussion, Message::mine(next_id, text, reply_to, false));
                 next_id += 1;

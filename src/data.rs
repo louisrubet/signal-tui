@@ -33,9 +33,15 @@ impl Message {
 pub struct Discussion {
     pub title: String,
     pub messages: Vec<Message>,
+    /// Has messages received since it was last opened.
+    pub unread: bool,
 }
 
 impl Discussion {
+    pub fn new(title: String) -> Self {
+        Discussion { title, messages: Vec::new(), unread: false }
+    }
+
     /// Index of the message with this Signal id.
     pub fn position_of(&self, id: u64) -> Option<usize> {
         self.messages.iter().rposition(|m| m.id == id)
@@ -73,6 +79,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
     vec![
         Discussion {
             title: "Alice Martin".to_string(),
+            unread: false,
             messages: vec![
                 msg(false, "Alice Martin", "Hey! Are we still on for tomorrow?", "2026-07-15 09:12"),
                 msg(true, "", "Yes, absolutely. What time works for you?", "2026-07-15 09:15"),
@@ -86,6 +93,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
         },
         Discussion {
             title: "Family Group".to_string(),
+            unread: true,
             messages: vec![
                 msg(false, "Mom", "Don't forget dinner on Sunday.", "2026-07-13 12:00"),
                 msg(false, "Dad", "I'll bring the wine.", "2026-07-13 12:03"),
@@ -95,6 +103,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
         },
         Discussion {
             title: "Bob Dupont".to_string(),
+            unread: false,
             messages: vec![
                 msg(false, "Bob Dupont", "Did you push the fix?", "2026-07-17 10:00"),
                 msg(true, "", "Yep, just pushed it.", "2026-07-17 10:01"),
@@ -110,6 +119,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
         },
         Discussion {
             title: "Chloe Renard".to_string(),
+            unread: false,
             messages: vec![
                 msg(false, "Chloe Renard", "Happy birthday!! 🎉", "2026-06-01 07:30"),
                 msg(true, "", "Thank you so much!", "2026-06-01 08:15"),

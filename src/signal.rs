@@ -329,6 +329,54 @@ impl Directory {
     }
 }
 
+/// When each conversation was last read, kept in a small text file next to the store:
+/// one `<conversation> <id of the newest message read>` per line.
+pub struct ReadMarks {
+    path: PathBuf,
+    marks: HashMap<String, u64>,
+}
+
+impl ReadMarks {
+    /// Loads the marks; a missing file means nothing was read yet.
+    pub fn load(path: PathBuf) -> Self {
+        let marks = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let (key, id) = line.split_once(' ')?;
+                Some((key.to_string(), id.parse().ok()?))
+            })
+            .collect();
+        ReadMarks { path, marks }
+    }
+
+    /// Whether `discussion` has messages received after it was last read.
+    pub fn is_unread(&self, thread: &Thread, discussion: &Discussion) -> bool {
+        let last_read = self.marks.get(&thread_key(thread)).copied().unwrap_or(0);
+        discussion.messages.iter().any(|m| !m.from_me && m.id > last_read)
+    }
+
+    /// Records that every message of `discussion` is read, and saves.
+    pub fn mark_read(&mut self, thread: &Thread, discussion: &Discussion) -> std::io::Result<()> {
+        let Some(newest) = discussion.messages.iter().map(|m| m.id).max() else { return Ok(()) };
+        let mark = self.marks.entry(thread_key(thread)).or_default();
+        if *mark >= newest {
+            return Ok(());
+        }
+        *mark = newest;
+        let content: String = self.marks.iter().map(|(key, id)| format!("{key} {id}\n")).collect();
+        std::fs::write(&self.path, content)
+    }
+}
+
+/// Stable text key of a conversation.
+fn thread_key(thread: &Thread) -> String {
+    match thread {
+        Thread::Contact(id) => id.service_id_string(),
+        Thread::Group(key) => key.iter().map(|b| format!("{b:02x}")).collect(),
+    }
+}
+
 /// Builds the interface discussions for `conversations`, with their stored messages.
 /// The threads are returned in the same order, to know where to send.
 pub async fn load_discussions(
@@ -339,7 +387,7 @@ pub async fn load_discussions(
     let mut threads = Vec::new();
     let mut discussions = Vec::new();
     for conversation in conversations {
-        let mut discussion = Discussion { title: conversation.title.clone(), messages: Vec::new() };
+        let mut discussion = Discussion::new(conversation.title.clone());
         let mut contents: Vec<Content> = manager.store().messages(&conversation.thread, ..).await?.flatten().collect();
         contents.sort_by_key(|c| c.metadata.client_timestamp);
         for content in &contents {

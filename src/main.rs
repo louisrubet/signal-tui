@@ -15,7 +15,7 @@ use crossterm::event::{Event, EventStream};
 use crossterm::terminal;
 use futures::StreamExt;
 use mysignalcli::data::Discussion;
-use mysignalcli::signal::{self, Directory, Thread};
+use mysignalcli::signal::{self, Directory, ReadMarks, Thread};
 use mysignalcli::tui::{Action, App, TerminalGuard};
 use mysignalcli::qr;
 use presage::model::messages::Received;
@@ -59,7 +59,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let seen = signal::sync(&mut manager, contacts_timeout).await?;
     let conversations = signal::conversations(&manager, seen).await?;
     let directory = Directory::load(&manager).await?;
-    let (mut threads, discussions) = signal::load_discussions(&manager, &directory, &conversations).await?;
+    let (mut threads, mut discussions) = signal::load_discussions(&manager, &directory, &conversations).await?;
+    let mut read_marks = ReadMarks::load(path.with_extension("read"));
+    for (thread, discussion) in threads.iter().zip(&mut discussions) {
+        discussion.unread = read_marks.is_unread(thread, discussion);
+    }
     let mut app = App::new(discussions);
 
     // Messages arriving while the interface runs, on a clone so `manager` stays free to send.
@@ -83,6 +87,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
                 let (discussion, text, reply_to, forwarded) = match action {
                     Action::Quit => break,
+                    Action::Opened(idx) => {
+                        if let Err(e) = read_marks.mark_read(&threads[idx], &app.discussions[idx]) {
+                            app.set_status(format!("Cannot save the read state: {e}"));
+                        }
+                        continue;
+                    }
                     Action::Send { discussion, text, reply_to } => (discussion, text, reply_to, false),
                     Action::Forward { from, msg, to } => (to, app.discussions[from].messages[msg].text.clone(), None, true),
                 };
@@ -122,11 +132,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         let title = manager.thread_title(&thread).await.unwrap_or_default();
                         let title = if title.is_empty() { thread.to_string() } else { title };
                         threads.push(thread);
-                        app.push_discussion(Discussion { title, messages: Vec::new() })
+                        app.push_discussion(Discussion::new(title))
                     }
                 };
                 if let Some(message) = directory.resolve(&app.discussions[idx], &content) {
                     app.push_message(idx, message);
+                    // Arrived in the discussion being read: no star on the next start.
+                    if app.is_open(idx) && let Err(e) = read_marks.mark_read(&threads[idx], &app.discussions[idx]) {
+                        app.set_status(format!("Cannot save the read state: {e}"));
+                    }
                 }
             }
         }

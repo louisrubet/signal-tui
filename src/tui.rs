@@ -24,6 +24,8 @@ use crate::ui;
 #[derive(Debug, PartialEq)]
 pub enum Action {
     Quit,
+    /// Discussion opened: its messages are now read.
+    Opened(usize),
     /// Send `text` in `discussion`, quoting message `reply_to` of that discussion.
     Send { discussion: usize, text: String, reply_to: Option<usize> },
     /// Send the text of message `msg` of discussion `from` to discussion `to`.
@@ -81,14 +83,24 @@ impl App {
         self.discussions.len() - 1
     }
 
+    /// Whether `discussion` is the one shown (also while forwarding from it).
+    pub fn is_open(&self, discussion: usize) -> bool {
+        matches!(self.screen, Screen::Discussion { discussion_idx, .. } if discussion_idx == discussion)
+    }
+
     /// Appends a message to a discussion. If that discussion is open, the selection follows
-    /// the new message when it is ours or when the previous last message was selected.
+    /// the new message when it is ours or when the previous last message was selected;
+    /// otherwise a received message marks it unread.
     pub fn push_message(&mut self, discussion: usize, message: Message) {
-        let messages = &mut self.discussions[discussion].messages;
-        let was_last = messages.len().saturating_sub(1);
+        let open = self.is_open(discussion);
+        let target = &mut self.discussions[discussion];
+        let was_last = target.messages.len().saturating_sub(1);
         let from_me = message.from_me;
-        messages.push(message);
-        let last = messages.len() - 1;
+        target.messages.push(message);
+        let last = target.messages.len() - 1;
+        if !open && !from_me {
+            target.unread = true;
+        }
         if let Screen::Discussion { discussion_idx, selected_msg, .. } = &mut self.screen
             && *discussion_idx == discussion
             && (from_me || *selected_msg == was_last)
@@ -102,6 +114,15 @@ impl App {
             return None;
         }
         self.status = None;
+        if let Screen::List { selected, .. } = self.screen
+            && key.code == KeyCode::Enter
+            && selected < self.discussions.len()
+        {
+            let last_msg = self.discussions[selected].messages.len().saturating_sub(1);
+            self.discussions[selected].unread = false;
+            self.screen = Screen::Discussion { discussion_idx: selected, selected_msg: last_msg, scroll: 0, composing: None };
+            return Some(Action::Opened(selected));
+        }
         let discussions = &self.discussions;
 
         match &mut self.screen {
@@ -111,12 +132,6 @@ impl App {
                     if *selected + 1 < discussions.len() {
                         *selected += 1;
                     }
-                }
-                KeyCode::Enter if !discussions.is_empty() => {
-                    let discussion_idx = *selected;
-                    let last_msg = discussions[discussion_idx].messages.len().saturating_sub(1);
-                    self.screen =
-                        Screen::Discussion { discussion_idx, selected_msg: last_msg, scroll: 0, composing: None };
                 }
                 KeyCode::Char('q') | KeyCode::Esc => return Some(Action::Quit),
                 _ => {}
@@ -345,7 +360,13 @@ fn draw_list(
         let y = (HEADER + row) as u16;
         let idx = *scroll + row;
         if idx < discussions.len() {
-            let text = ui::pad_left(&discussions[idx].title, width);
+            let discussion = &discussions[idx];
+            // The star takes two columns but counts as one character: pad one less.
+            let text = if discussion.unread {
+                format!("\u{2b50} {}", ui::pad_left(&discussion.title, width.saturating_sub(3)))
+            } else {
+                format!("   {}", ui::pad_left(&discussion.title, width.saturating_sub(3)))
+            };
             print_row(out, y, &text, idx == selected)?;
         } else {
             print_row(out, y, &" ".repeat(width), false)?;
@@ -476,7 +497,7 @@ mod tests {
     /// Opens the first discussion (last message selected).
     fn opened() -> App {
         let mut app = app();
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(0)));
         app
     }
 
@@ -531,6 +552,27 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         let forward = app.handle_key(key(KeyCode::Enter));
         assert_eq!(forward, Some(Action::Forward { from: 0, msg: last, to: 1 }));
+    }
+
+    #[test]
+    fn received_messages_mark_other_discussions_unread() {
+        let mut app = opened();
+        let received = || Message { from_me: false, ..Message::mine(1, "hi".to_string(), None, false) };
+        app.push_message(0, received());
+        app.push_message(2, received());
+        app.push_message(3, Message::mine(2, "sent".to_string(), None, false));
+        assert!(!app.discussions[0].unread, "open discussion stays read");
+        assert!(app.discussions[2].unread);
+        assert!(!app.discussions[3].unread, "own messages are not updates");
+    }
+
+    #[test]
+    fn opening_a_discussion_reads_it() {
+        let mut app = app();
+        app.handle_key(key(KeyCode::Down));
+        assert!(app.discussions[1].unread);
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(1)));
+        assert!(!app.discussions[1].unread);
     }
 
     #[test]
