@@ -105,6 +105,10 @@ pub struct App {
     status: Option<String>,
     /// Text to put in the clipboard on the next draw.
     clipboard: Option<String>,
+    /// Chats shown by a page of the chat list, as last drawn (PageUp / PageDown).
+    list_page: usize,
+    /// Messages to jump by a page in a discussion, from the last draw (PageUp / PageDown).
+    message_page: usize,
 }
 
 impl App {
@@ -117,6 +121,8 @@ impl App {
             screen: Screen::List { selected: first, scroll: 0 },
             status: None,
             clipboard: None,
+            list_page: 10,
+            message_page: 5,
         }
     }
 
@@ -199,6 +205,8 @@ impl App {
             Screen::List { selected, .. } => match key.code {
                 KeyCode::Up => *selected = step(discussions, *selected, -1),
                 KeyCode::Down => *selected = step(discussions, *selected, 1),
+                KeyCode::PageUp => *selected = step(discussions, *selected, -(self.list_page as isize)),
+                KeyCode::PageDown => *selected = step(discussions, *selected, self.list_page as isize),
                 KeyCode::Char('P') if *selected < discussions.len() => {
                     let idx = *selected;
                     // Pinning again puts the chat at the end of the pinned list.
@@ -261,6 +269,10 @@ impl App {
                                 *selected_msg += 1;
                             }
                         }
+                        KeyCode::PageUp => *selected_msg = selected_msg.saturating_sub(self.message_page),
+                        KeyCode::PageDown => {
+                            *selected_msg = (*selected_msg + self.message_page).min(messages.len().saturating_sub(1))
+                        }
                         KeyCode::Enter => *composing = Some(Compose::new("", None)),
                         KeyCode::Esc => {
                             let back_to = *discussion_idx;
@@ -307,6 +319,8 @@ impl App {
             Screen::Forward { discussion_idx, msg_idx, selected, .. } => match key.code {
                 KeyCode::Up => *selected = step(discussions, *selected, -1),
                 KeyCode::Down => *selected = step(discussions, *selected, 1),
+                KeyCode::PageUp => *selected = step(discussions, *selected, -(self.list_page as isize)),
+                KeyCode::PageDown => *selected = step(discussions, *selected, self.list_page as isize),
                 KeyCode::Enter => {
                     let action = Action::Forward { from: *discussion_idx, msg: *msg_idx, to: *selected };
                     let (discussion_idx, selected_msg) = (*discussion_idx, *msg_idx);
@@ -357,6 +371,7 @@ impl App {
             copy_to_clipboard(out, &text)?;
         }
         let typing: Vec<usize> = self.typing.iter().map(|t| t.discussion).collect();
+        self.list_page = (h as usize).saturating_sub(FOOTER).max(1);
         match &mut self.screen {
             Screen::List { selected, scroll } => draw_list(
                 out,
@@ -369,17 +384,22 @@ impl App {
                 w,
                 h,
             ),
-            Screen::Discussion { discussion_idx, selected_msg, scroll, composing } => draw_discussion(
-                out,
-                &self.discussions[*discussion_idx],
-                &self.typing.iter().filter(|t| t.discussion == *discussion_idx).map(|t| t.name.as_str()).collect::<Vec<_>>(),
-                *selected_msg,
-                scroll,
-                composing.as_ref(),
-                self.status.as_deref(),
-                w,
-                h,
-            ),
+            Screen::Discussion { discussion_idx, selected_msg, scroll, composing } => {
+                let visible = draw_discussion(
+                    out,
+                    &self.discussions[*discussion_idx],
+                    &self.typing.iter().filter(|t| t.discussion == *discussion_idx).map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                    *selected_msg,
+                    scroll,
+                    composing.as_ref(),
+                    self.status.as_deref(),
+                    w,
+                    h,
+                )?;
+                // A page keeps one message of context.
+                self.message_page = visible.saturating_sub(1).max(1);
+                Ok(())
+            }
             Screen::Forward { selected, scroll, .. } => draw_list(
                 out,
                 &self.discussions,
@@ -595,7 +615,7 @@ fn draw_discussion(
     status: Option<&str>,
     w: u16,
     h: u16,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     let width = w as usize;
     let height = h as usize;
 
@@ -677,11 +697,13 @@ fn draw_discussion(
     print_row(out, 0, &ui::pad_left(&discussion.title, width), false)?;
     print_row(out, 1, &" ".repeat(width), false)?;
 
+    let mut visible_messages = std::collections::BTreeSet::new();
     for row in 0..viewport {
         let y = (HEADER + row) as u16;
         let idx = *scroll + row;
         if idx < lines.len() {
             let rl = &lines[idx];
+            visible_messages.extend(rl.msg_idx);
             let text = ui::render_line_string(&rl.kind, width);
             let selected = rl.msg_idx == Some(selected_msg);
             print_row(out, y, &text, selected)?;
@@ -697,7 +719,8 @@ fn draw_discussion(
     if let Some((col, row)) = cursor_pos {
         queue!(out, cursor::MoveTo(col as u16, (footer_y + row) as u16), cursor::Show)?;
     }
-    Ok(())
+    // Messages at least partly on screen.
+    Ok(visible_messages.len())
 }
 
 #[cfg(test)]
@@ -889,6 +912,40 @@ mod tests {
         assert_eq!(pinned(&mut app), ["Family Group"]);
         app.handle_key(key(KeyCode::Char('P')));
         assert_eq!(pinned(&mut app), ["Family Group", "Alice Martin"]);
+    }
+
+    #[test]
+    fn page_keys_jump_a_page_of_chats() {
+        let titles: Vec<Discussion> = (0..50).map(|i| Discussion::new(format!("Chat {i}"))).collect();
+        let mut app = App::new(titles);
+        let mut out = Vec::new();
+        app.draw(&mut out, 80, 11).unwrap(); // 10 rows of list above the help line
+        app.handle_key(key(KeyCode::PageDown));
+        app.handle_key(key(KeyCode::PageDown));
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(10)));
+
+        let mut app = App::new((0..5).map(|i| Discussion::new(format!("Chat {i}"))).collect());
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(4)), "clamped to the last chat");
+    }
+
+    #[test]
+    fn page_keys_jump_a_page_of_messages() {
+        let mut discussion = Discussion::new("Long".to_string());
+        discussion.messages = (0..40).map(|i| Message::mine(i, format!("message {i}"), None, false)).collect();
+        let mut app = App::new(vec![discussion]);
+        app.handle_key(key(KeyCode::Enter)); // last message (39) selected
+        let mut out = Vec::new();
+        app.draw(&mut out, 80, 23).unwrap(); // 20 lines of messages: 3 lines each, 7 messages
+        app.handle_key(key(KeyCode::PageUp));
+        // Reply to read which message is selected.
+        app.handle_key(key(KeyCode::Char('r')));
+        type_text(&mut app, "x");
+        let send = app.handle_key(key(KeyCode::Enter));
+        let Some(Action::Send { reply_to: Some(selected), .. }) = send else { panic!("{send:?}") };
+        assert_eq!(selected, 39 - app.message_page);
+        assert!(app.message_page >= 5, "about a screen of messages, got {}", app.message_page);
     }
 
     #[test]
