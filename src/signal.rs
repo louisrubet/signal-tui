@@ -15,6 +15,19 @@ pub async fn open_store(path: &str, passphrase: Option<&str>) -> Result<SqliteSt
     SqliteStore::open_with_passphrase(path, passphrase, OnNewIdentity::Trust).await
 }
 
+/// Deletes the local store (database plus its SQLite `-wal`/`-shm` files), forgetting the link.
+///
+/// The device stays listed on the phone (Settings > Linked devices) until it is removed there.
+pub fn remove_store(path: &str) -> std::io::Result<()> {
+    for file in [path.to_string(), format!("{path}-wal"), format!("{path}-shm")] {
+        match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Links this client as a secondary device of an existing Signal account.
 ///
 /// `provisioning_link` receives the `sgnl://linkdevice?...` URL as soon as the Signal

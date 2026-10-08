@@ -1,10 +1,11 @@
 //! Links this client to your Signal account and checks the connection.
 //!
-//!   cargo run --example link_device
+//!   cargo run --example link_device [-- --reset]
 //!
 //! On the first run, scan the QR code from the phone (Settings > Linked devices).
 //! The store is kept in `$SIGNAL_TUI_DB` (default `signal-tui.db3`), so later runs
-//! reuse the link instead of asking again.
+//! reuse the link instead of asking again. `--reset` deletes the store first, to link
+//! again from scratch (also remove the old device from the phone).
 
 use crossterm::style::{Color, Stylize};
 use futures::channel::oneshot;
@@ -43,6 +44,19 @@ fn print_qr(data: &str) {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let db = std::env::var("SIGNAL_TUI_DB").unwrap_or_else(|_| "signal-tui.db3".to_string());
+
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("--reset") => {
+            signal::remove_store(&db).expect("cannot delete the store");
+            println!("Store {db} deleted. Also remove the old \"signal-tui\" device from the phone (Settings > Linked devices).");
+        }
+        Some(arg) => {
+            eprintln!("unknown argument {arg:?}\nusage: link_device [--reset]");
+            std::process::exit(2);
+        }
+    }
+
     let store = signal::open_store(&db, None).await.unwrap();
 
     let manager = match signal::load_registered(store.clone()).await {
