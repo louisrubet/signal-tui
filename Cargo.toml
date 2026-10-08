@@ -1,0 +1,23 @@
+[package]
+name = "mysignalcli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.28"
+chrono = "0.4"
+futures = "0.3"
+presage = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb" }
+tokio = { version = "1.48", features = ["macros", "rt", "time"] }
+url = "2.5"
+
+[dev-dependencies]
+base64 = "0.22"
+open = "5.3"
+qrcode = { version = "0.14", default-features = false }
+tempfile = "3.9"
+
+# Same patch as the presage workspace: presage-store-sqlite needs this libsqlite3-sys fork for SQLCipher.
+[patch.crates-io]
+libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }

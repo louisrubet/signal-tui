@@ -1,0 +1,3 @@
+/target
+# Local Signal store (keys of the linked device)
+*.db3*
