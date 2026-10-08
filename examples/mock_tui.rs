@@ -6,8 +6,8 @@ use std::io::{self, Write, stdout};
 
 use crossterm::event::{self, Event};
 use crossterm::terminal;
-use mysignalcli::data::{self, Message};
-use mysignalcli::tui::{Action, App, TerminalGuard};
+use signal_tui::data::{self, Message};
+use signal_tui::tui::{Action, App, TerminalGuard};
 
 fn main() -> io::Result<()> {
     let mut app = App::new(data::mock_discussions());
@@ -30,7 +30,7 @@ fn main() -> io::Result<()> {
         };
         match action {
             Some(Action::Quit) => return Ok(()),
-            Some(Action::Opened(_)) => {}
+            Some(Action::Opened(_) | Action::SettingsChanged) => {}
             Some(Action::Send { discussion, text, reply_to }) => {
                 app.push_message(discussion, Message::mine(next_id, text, reply_to, false));
                 next_id += 1;

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use futures::channel::oneshot;
 use futures::future::{self, Either};
-use mysignalcli::signal;
+use signal_tui::signal;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 

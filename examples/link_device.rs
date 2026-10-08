@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use mysignalcli::{qr, signal};
+use signal_tui::{qr, signal};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {

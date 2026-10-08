@@ -14,10 +14,11 @@ use std::time::Duration;
 use crossterm::event::{Event, EventStream};
 use crossterm::terminal;
 use futures::StreamExt;
-use mysignalcli::data::Discussion;
-use mysignalcli::signal::{self, Directory, ReadMarks, Thread};
-use mysignalcli::tui::{Action, App, TerminalGuard};
-use mysignalcli::qr;
+use signal_tui::data::{Discussion, Message};
+use signal_tui::settings::Settings;
+use signal_tui::signal::{self, Directory, ReadMarks, Thread};
+use signal_tui::tui::{Action, App, TerminalGuard};
+use signal_tui::qr;
 use presage::model::messages::Received;
 
 const USAGE: &str = "usage: signal-tui [--reset]";
@@ -65,6 +66,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         discussion.unread = read_marks.is_unread(thread, discussion);
     }
     let mut app = App::new(discussions);
+    let settings_path = Settings::default_path()?;
+    app.settings = Settings::load(&settings_path);
 
     // Messages arriving while the interface runs, on a clone so `manager` stays free to send.
     let mut receiver = manager.clone();
@@ -94,6 +97,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
                 let (discussion, text, reply_to, forwarded) = match action {
                     Action::Quit => break,
+                    Action::SettingsChanged => {
+                        if let Err(e) = app.settings.save(&settings_path) {
+                            app.set_status(format!("Cannot save the parameters: {e}"));
+                        }
+                        continue;
+                    }
                     Action::Opened(idx) => {
                         if let Err(e) = read_marks.mark_read(&threads[idx], &app.discussions[idx]) {
                             app.set_status(format!("Cannot save the read state: {e}"));
@@ -129,6 +138,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 };
                 let Received::Content(content) = received else { continue };
                 let Ok(thread) = Thread::try_from(&*content) else { continue };
+                let is_group = matches!(thread, Thread::Group(_));
                 if directory.to_message(&content).is_none() {
                     continue;
                 }
@@ -143,6 +153,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     }
                 };
                 if let Some(message) = directory.resolve(&app.discussions[idx], &content) {
+                    if app.settings.notifications && !message.from_me && !app.is_open(idx) {
+                        notify(&app.discussions[idx], &message, is_group);
+                    }
                     app.push_message(idx, message);
                     // Arrived in the discussion being read: no star on the next start.
                     if app.is_open(idx) && let Err(e) = read_marks.mark_read(&threads[idx], &app.discussions[idx]) {
@@ -153,4 +166,29 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+/// Desktop notification for a received message: the conversation as title, the text as body
+/// (prefixed by the sender in groups).
+fn notify(discussion: &Discussion, message: &Message, is_group: bool) {
+    let summary = discussion.title.clone();
+    let body = if is_group { format!("{}: {}", message.sender_name, message.text) } else { message.text.clone() };
+    // Notification servers block on D-Bus / OS calls: keep them off the event loop.
+    // Failures (no notification server…) are not worth interrupting the user for.
+    tokio::task::spawn_blocking(move || {
+        let _ = notify_rust::Notification::new()
+            .appname("signal-tui")
+            .summary(&summary)
+            .body(&escape_markup(&body))
+            .show();
+    });
+}
+
+/// The freedesktop notification body is markup: `<`, `>` and `&` must be escaped there.
+fn escape_markup(text: &str) -> String {
+    if cfg!(all(unix, not(target_os = "macos"))) {
+        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    } else {
+        text.to_string()
+    }
 }

@@ -19,6 +19,7 @@ use crossterm::{
 
 use crate::data::{self, Discussion, Message};
 use crate::editor::Editor;
+use crate::settings::Settings;
 use crate::ui;
 
 /// What the caller has to do after a key press.
@@ -31,6 +32,8 @@ pub enum Action {
     Send { discussion: usize, text: String, reply_to: Option<usize> },
     /// Send the text of message `msg` of discussion `from` to discussion `to`.
     Forward { from: usize, msg: usize, to: usize },
+    /// [`App::settings`] changed: save them.
+    SettingsChanged,
 }
 
 enum Screen {
@@ -52,7 +55,19 @@ enum Screen {
         selected: usize,
         scroll: usize,
     },
+    /// The parameters, opened from the discussion list (`back_to` is its selection).
+    Settings {
+        selected: usize,
+        back_to: usize,
+    },
 }
+
+/// A parameter shown on the parameters screen: label and the setting it toggles.
+type Toggle = (&'static str, fn(&mut Settings) -> &mut bool);
+
+/// The parameters shown, in order.
+const SETTINGS: [Toggle; 1] =
+    [("Desktop notifications for new messages", |s| &mut s.notifications)];
 
 struct Compose {
     editor: Editor,
@@ -68,6 +83,7 @@ impl Compose {
 
 pub struct App {
     pub discussions: Vec<Discussion>,
+    pub settings: Settings,
     screen: Screen,
     /// One-shot feedback shown in the footer until the next key press.
     status: Option<String>,
@@ -77,7 +93,13 @@ pub struct App {
 
 impl App {
     pub fn new(discussions: Vec<Discussion>) -> Self {
-        App { discussions, screen: Screen::List { selected: 0, scroll: 0 }, status: None, clipboard: None }
+        App {
+            discussions,
+            settings: Settings::default(),
+            screen: Screen::List { selected: 0, scroll: 0 },
+            status: None,
+            clipboard: None,
+        }
     }
 
     pub fn set_status(&mut self, status: impl Into<String>) {
@@ -139,6 +161,10 @@ impl App {
                     if *selected + 1 < discussions.len() {
                         *selected += 1;
                     }
+                }
+                KeyCode::Char('p') => {
+                    let back_to = *selected;
+                    self.screen = Screen::Settings { selected: 0, back_to };
                 }
                 KeyCode::Char('q') | KeyCode::Esc => return Some(Action::Quit),
                 _ => {}
@@ -249,6 +275,21 @@ impl App {
                 }
                 _ => {}
             },
+            Screen::Settings { selected, back_to } => match key.code {
+                KeyCode::Up => *selected = selected.saturating_sub(1),
+                KeyCode::Down => *selected = (*selected + 1).min(SETTINGS.len() - 1),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let value = (SETTINGS[*selected].1)(&mut self.settings);
+                    *value = !*value;
+                    return Some(Action::SettingsChanged);
+                }
+                KeyCode::Esc | KeyCode::Char('p') => {
+                    let selected = *back_to;
+                    self.screen = Screen::List { selected, scroll: 0 };
+                }
+                KeyCode::Char('q') => return Some(Action::Quit),
+                _ => {}
+            },
         }
         None
     }
@@ -276,7 +317,7 @@ impl App {
                 out,
                 &self.discussions,
                 "Discussions",
-                "\u{2191}/\u{2193} select discussion   Enter open   q quit",
+                "\u{2191}/\u{2193} select discussion   Enter open   p parameters   q quit",
                 *selected,
                 scroll,
                 w,
@@ -302,6 +343,9 @@ impl App {
                 w,
                 h,
             ),
+            Screen::Settings { selected, .. } => {
+                draw_settings(out, &mut self.settings, *selected, self.status.as_deref(), w, h)
+            }
         }
     }
 }
@@ -408,6 +452,27 @@ fn draw_list(
     }
 
     print_row(out, (height - 1) as u16, &ui::pad_left(help, width), false)?;
+    Ok(())
+}
+
+fn draw_settings(
+    out: &mut impl Write,
+    settings: &mut Settings,
+    selected: usize,
+    status: Option<&str>,
+    w: u16,
+    h: u16,
+) -> io::Result<()> {
+    let width = w as usize;
+    let height = h as usize;
+    queue!(out, Clear(ClearType::All), cursor::Hide)?;
+    print_row(out, 0, &ui::pad_left("Parameters", width), false)?;
+    for (i, (label, value)) in SETTINGS.iter().enumerate() {
+        let mark = if *value(settings) { "x" } else { " " };
+        print_row(out, (HEADER + i) as u16, &ui::pad_left(&format!("[{mark}] {label}"), width), i == selected)?;
+    }
+    let help = "\u{2191}/\u{2193} select   Space/Enter toggle   Esc back   q quit";
+    print_row(out, (height - 1) as u16, &ui::pad_left(status.unwrap_or(help), width), false)?;
     Ok(())
 }
 
@@ -609,6 +674,18 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         let forward = app.handle_key(key(KeyCode::Enter));
         assert_eq!(forward, Some(Action::Forward { from: 0, msg: last, to: 1 }));
+    }
+
+    #[test]
+    fn parameters_toggle_notifications() {
+        let mut app = app();
+        assert!(app.settings.notifications, "on by default");
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.handle_key(key(KeyCode::Char(' '))), Some(Action::SettingsChanged));
+        assert!(!app.settings.notifications);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(1)), "back on the same discussion");
     }
 
     #[test]

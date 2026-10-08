@@ -25,6 +25,7 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 | `f` | forward the selected message |
 | `c` | copy the selected message (OSC 52) |
 | `o` | open the links of the selected message |
+| `p` | parameters (from the chat list) |
 | `Esc` | back |
 | `q` | quit |
 
