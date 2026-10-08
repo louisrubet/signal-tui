@@ -20,8 +20,15 @@ fn main() -> io::Result<()> {
         app.draw(&mut out, w, h)?;
         out.flush()?;
 
-        let Event::Key(key) = event::read()? else { continue };
-        match app.handle_key(key) {
+        let action = match event::read()? {
+            Event::Key(key) => app.handle_key(key),
+            Event::Paste(text) => {
+                app.handle_paste(&text);
+                None
+            }
+            _ => None,
+        };
+        match action {
             Some(Action::Quit) => return Ok(()),
             Some(Action::Opened(_)) => {}
             Some(Action::Send { discussion, text, reply_to }) => {

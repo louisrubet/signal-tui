@@ -9,8 +9,8 @@ use base64::Engine;
 use crossterm::{
     cursor,
     event::{
-        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute, queue,
     style::{Attribute, Print, SetAttribute},
@@ -18,6 +18,7 @@ use crossterm::{
 };
 
 use crate::data::{self, Discussion, Message};
+use crate::editor::Editor;
 use crate::ui;
 
 /// What the caller has to do after a key press.
@@ -54,9 +55,15 @@ enum Screen {
 }
 
 struct Compose {
-    buffer: String,
+    editor: Editor,
     /// Message being replied to, in the current discussion.
     reply_to: Option<usize>,
+}
+
+impl Compose {
+    fn new(text: &str, reply_to: Option<usize>) -> Self {
+        Compose { editor: Editor::new(text), reply_to }
+    }
 }
 
 pub struct App {
@@ -139,14 +146,15 @@ impl App {
             Screen::Discussion { discussion_idx, selected_msg, composing, .. } => {
                 let messages = &discussions[*discussion_idx].messages;
                 if let Some(compose) = composing {
+                    let editor = &mut compose.editor;
                     match key.code {
                         KeyCode::Esc => *composing = None,
                         // Shift+Enter needs the kitty keyboard protocol; Alt+Enter works everywhere.
                         KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
-                            compose.buffer.push('\n')
+                            editor.insert("\n")
                         }
                         KeyCode::Enter => {
-                            let text = compose.buffer.trim();
+                            let text = editor.text().trim();
                             if !text.is_empty() {
                                 let action = Action::Send {
                                     discussion: *discussion_idx,
@@ -157,10 +165,18 @@ impl App {
                                 return Some(action);
                             }
                         }
-                        KeyCode::Backspace => {
-                            compose.buffer.pop();
+                        KeyCode::Backspace => editor.backspace(),
+                        KeyCode::Delete => editor.delete(),
+                        KeyCode::Left => editor.left(),
+                        KeyCode::Right => editor.right(),
+                        KeyCode::Up => editor.up(),
+                        KeyCode::Down => editor.down(),
+                        KeyCode::Home => editor.home(),
+                        KeyCode::End => editor.end(),
+                        // Ctrl+letter is a shortcut, not text (Ctrl+C must not type a "c").
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            editor.insert(c.encode_utf8(&mut [0; 4]))
                         }
-                        KeyCode::Char(c) => compose.buffer.push(c),
                         _ => {}
                     }
                 } else {
@@ -171,7 +187,7 @@ impl App {
                                 *selected_msg += 1;
                             }
                         }
-                        KeyCode::Enter => *composing = Some(Compose { buffer: String::new(), reply_to: None }),
+                        KeyCode::Enter => *composing = Some(Compose::new("", None)),
                         KeyCode::Esc => {
                             let back_to = *discussion_idx;
                             self.screen = Screen::List { selected: back_to, scroll: 0 };
@@ -180,7 +196,7 @@ impl App {
                         // Actions on the selected message (there is none in an empty discussion).
                         KeyCode::Char('r' | 'f' | 'c' | 'o') if messages.is_empty() => {}
                         KeyCode::Char('r') => {
-                            *composing = Some(Compose { buffer: String::new(), reply_to: Some(*selected_msg) })
+                            *composing = Some(Compose::new("", Some(*selected_msg)))
                         }
                         KeyCode::Char('f') => {
                             let (discussion_idx, msg_idx) = (*discussion_idx, *selected_msg);
@@ -207,7 +223,9 @@ impl App {
                                 (n, f) => format!("Could not open {f} of {n} link(s)"),
                             });
                         }
-                        KeyCode::Char(c) => *composing = Some(Compose { buffer: c.to_string(), reply_to: None }),
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            *composing = Some(Compose::new(c.encode_utf8(&mut [0; 4]), None))
+                        }
                         _ => {}
                     }
                 }
@@ -233,6 +251,19 @@ impl App {
             },
         }
         None
+    }
+
+    /// Pasted text (Ctrl+Shift+V, middle click…) goes into the message being typed, as is:
+    /// its line breaks stay line breaks instead of sending the message. In a discussion
+    /// that is not being written to, it starts a new message.
+    pub fn handle_paste(&mut self, text: &str) {
+        self.status = None;
+        if let Screen::Discussion { composing, .. } = &mut self.screen {
+            match composing {
+                Some(compose) => compose.editor.insert(text),
+                None => *composing = Some(Compose::new(text, None)),
+            }
+        }
     }
 
     /// Draws the current screen on a `w` x `h` terminal.
@@ -290,6 +321,8 @@ impl TerminalGuard {
         if enhanced_keys {
             execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
         }
+        // Pastes arrive as one event, so their line breaks do not act as Enter.
+        execute!(out, EnableBracketedPaste)?;
         Ok(TerminalGuard { enhanced_keys })
     }
 }
@@ -297,6 +330,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut out = stdout();
+        let _ = execute!(out, DisableBracketedPaste);
         if self.enhanced_keys {
             let _ = execute!(out, PopKeyboardEnhancementFlags);
         }
@@ -377,12 +411,6 @@ fn draw_list(
     Ok(())
 }
 
-/// Last `n` characters of `s`, so the end of what is being typed stays visible.
-fn tail(s: &str, n: usize) -> &str {
-    let skip = s.chars().count().saturating_sub(n);
-    s.char_indices().nth(skip).map_or("", |(i, _)| &s[i..])
-}
-
 #[allow(clippy::too_many_arguments)]
 fn draw_discussion(
     out: &mut impl Write,
@@ -401,27 +429,32 @@ fn draw_discussion(
     // (at most half the screen, showing the end of the draft).
     let mut cursor_pos = None;
     let footer: Vec<String> = match composing {
-        Some(Compose { buffer, reply_to }) => {
+        Some(Compose { editor, reply_to }) => {
             let prompt = match reply_to.and_then(|i| discussion.messages.get(i)) {
                 Some(m) if m.from_me => "Reply to yourself> ".to_string(),
                 Some(m) => format!("Reply to {}> ", m.sender_name),
                 None => "> ".to_string(),
             };
             let indent = " ".repeat(prompt.chars().count());
-            let avail = width.saturating_sub(indent.len());
+            let avail = width.saturating_sub(indent.len()).max(1);
             let max_rows = (height.saturating_sub(HEADER) / 2).max(1);
-            let draft: Vec<&str> = buffer.split('\n').collect();
-            let first = draft.len().saturating_sub(max_rows);
-            let rows: Vec<String> = draft[first..]
+            let draft: Vec<&str> = editor.text().split('\n').collect();
+            let (cursor_line, cursor_col) = editor.cursor_line_col();
+            // Rows shown: the end of the draft, or up to the cursor line if it is higher.
+            let first = draft.len().saturating_sub(max_rows).min(cursor_line);
+            // The cursor line scrolls sideways to keep the cursor visible.
+            let offset = cursor_col.saturating_sub(avail - 1);
+            let rows: Vec<String> = draft[first..(first + max_rows).min(draft.len())]
                 .iter()
                 .enumerate()
                 .map(|(i, line)| {
                     let lead = if first + i == 0 { &prompt } else { &indent };
-                    format!("{lead}{}", tail(line, avail))
+                    let skip = if first + i == cursor_line { offset } else { 0 };
+                    format!("{lead}{}", line.chars().skip(skip).take(avail).collect::<String>())
                 })
                 .collect();
-            let last = rows.last().map_or(0, |r| r.chars().count());
-            cursor_pos = Some((last.min(width.saturating_sub(1)), rows.len() - 1));
+            let col = indent.len() + cursor_col - offset;
+            cursor_pos = Some((col.min(width.saturating_sub(1)), cursor_line - first));
             rows
         }
         None => {
@@ -531,6 +564,30 @@ mod tests {
         type_text(&mut app, "b");
         let send = app.handle_key(key(KeyCode::Enter));
         assert_eq!(send, Some(Action::Send { discussion: 0, text: "a\nb".to_string(), reply_to: None }));
+    }
+
+    #[test]
+    fn arrows_move_the_cursor_in_the_draft() {
+        let mut app = opened();
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "ac");
+        app.handle_key(key(KeyCode::Left));
+        type_text(&mut app, "b");
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Delete));
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), None);
+        let send = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "bc".to_string(), reply_to: None }));
+    }
+
+    #[test]
+    fn paste_keeps_line_breaks_without_sending() {
+        let mut app = opened();
+        app.handle_paste("line 1\nline 2");
+        type_text(&mut app, "!");
+        let send = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "line 1\nline 2!".to_string(), reply_to: None }));
     }
 
     #[test]

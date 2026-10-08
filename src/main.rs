@@ -82,8 +82,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
         tokio::select! {
             event = keys.next() => {
                 let Some(event) = event else { break };
-                let Event::Key(key) = event? else { continue };
-                let Some(action) = app.handle_key(key) else { continue };
+                let action = match event? {
+                    Event::Key(key) => app.handle_key(key),
+                    Event::Paste(text) => {
+                        app.handle_paste(&text);
+                        None
+                    }
+                    _ => None,
+                };
+                let Some(action) = action else { continue };
 
                 let (discussion, text, reply_to, forwarded) = match action {
                     Action::Quit => break,
