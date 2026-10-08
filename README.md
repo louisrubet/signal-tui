@@ -6,6 +6,8 @@ A Signal client for the terminal, linked to your phone as a secondary device (li
 
 ## Run
 
+Needs Rust ≥ 1.89, `protoc` (`protobuf-compiler` package) and a C compiler.
+
 ```sh
 cargo run
 ```
