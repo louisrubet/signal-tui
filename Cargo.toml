@@ -7,8 +7,9 @@ edition = "2024"
 crossterm = "0.28"
 chrono = "0.4"
 futures = "0.3"
-presage = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb" }
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb" }
+# Fork of whisperfish/presage, branch storage-groups: adds Manager::sync_groups_from_storage_service.
+presage = { git = "https://github.com/louisrubet/presage", rev = "85ff409f7c5b8cec91ba531a9c2b0a0e1687f43d" }
+presage-store-sqlite = { git = "https://github.com/louisrubet/presage", rev = "85ff409f7c5b8cec91ba531a9c2b0a0e1687f43d" }
 tokio = { version = "1.48", features = ["macros", "rt", "time"] }
 url = "2.5"
 

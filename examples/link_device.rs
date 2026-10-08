@@ -1,4 +1,4 @@
-//! Links this client to your Signal account and checks the connection.
+//! Links this client to your Signal account if needed, then prints your conversations.
 //!
 //!   cargo run --example link_device [-- --reset]
 //!
@@ -6,6 +6,12 @@
 //! The store is kept in `$SIGNAL_TUI_DB` (default `signal-tui.db3`), so later runs
 //! reuse the link instead of asking again. `--reset` deletes the store first, to link
 //! again from scratch (also remove the old device from the phone).
+//!
+//! Signal does not hand the message history to linked devices: conversations come from
+//! the contacts and groups synced by the phone, and only messages received since the
+//! link are known.
+
+use std::time::Duration;
 
 use crossterm::style::{Color, Stylize};
 use futures::channel::oneshot;
@@ -59,7 +65,7 @@ async fn main() {
 
     let store = signal::open_store(&db, None).await.unwrap();
 
-    let manager = match signal::load_registered(store.clone()).await {
+    let mut manager = match signal::load_registered(store.clone()).await {
         Ok(manager) => manager,
         Err(presage::Error::NotYetRegisteredError) => {
             let (tx, rx) = oneshot::channel::<url::Url>();
@@ -77,5 +83,20 @@ async fn main() {
     };
 
     let whoami = manager.whoami().await.expect("whoami request failed");
-    println!("Connected as {whoami:?}");
+    eprintln!("Connected as {}. Syncing\u{2026}", whoami.aci);
+
+    let seen = signal::sync(&mut manager, Duration::from_secs(15)).await.expect("sync failed");
+    let conversations = signal::conversations(&manager, seen).await.expect("cannot read the store");
+
+    // One line per conversation: date of the last message, title, message count, last message.
+    for c in &conversations {
+        let date = c.last_message.as_ref().map_or_else(|| " ".repeat(16), |(t, _)| t.format("%Y-%m-%d %H:%M").to_string());
+        let kind = match c.thread {
+            signal::Thread::Group(_) => "group",
+            signal::Thread::Contact(_) => "",
+        };
+        let last = c.last_message.as_ref().map_or(String::new(), |(_, text)| text.replace('\n', " "));
+        println!("{date}  {:<30} {kind:<5} {:>4} msg  {last}", c.title, c.message_count);
+    }
+    eprintln!("{} conversation(s)", conversations.len());
 }
