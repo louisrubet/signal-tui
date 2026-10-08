@@ -1,6 +1,10 @@
 use chrono::NaiveDateTime;
 
 pub struct Message {
+    /// Signal message id: the sender's timestamp in milliseconds (what quotes refer to).
+    pub id: u64,
+    /// ACI of the author, needed to quote the message.
+    pub author: Option<String>,
     pub from_me: bool,
     pub sender_name: String,
     pub text: String,
@@ -10,9 +14,32 @@ pub struct Message {
     pub forwarded: bool,
 }
 
+impl Message {
+    /// A message written here, sent now.
+    pub fn mine(id: u64, text: String, reply_to: Option<usize>, forwarded: bool) -> Self {
+        Message {
+            id,
+            author: None,
+            from_me: true,
+            sender_name: String::new(),
+            text,
+            timestamp: chrono::Local::now().naive_local(),
+            reply_to,
+            forwarded,
+        }
+    }
+}
+
 pub struct Discussion {
     pub title: String,
     pub messages: Vec<Message>,
+}
+
+impl Discussion {
+    /// Index of the message with this Signal id.
+    pub fn position_of(&self, id: u64) -> Option<usize> {
+        self.messages.iter().rposition(|m| m.id == id)
+    }
 }
 
 /// Returns the http(s) links found in `text`, without trailing punctuation.
@@ -29,11 +56,14 @@ fn dt(s: &str) -> NaiveDateTime {
 }
 
 fn msg(from_me: bool, sender_name: &str, text: &str, ts: &str) -> Message {
+    let timestamp = dt(ts);
     Message {
+        id: timestamp.and_utc().timestamp_millis() as u64,
+        author: None,
         from_me,
         sender_name: sender_name.to_string(),
         text: text.to_string(),
-        timestamp: dt(ts),
+        timestamp,
         reply_to: None,
         forwarded: false,
     }
@@ -75,6 +105,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
                     "Found the root cause: https://github.com/whisperfish/presage/issues and the docs (https://docs.rs/presage).",
                     "2026-07-17 10:30",
                 ),
+                Message { reply_to: Some(3), ..msg(true, "", "Thanks, having a look.", "2026-07-17 10:35") },
             ],
         },
         Discussion {

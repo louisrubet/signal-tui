@@ -3,8 +3,12 @@ name = "mysignalcli"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "signal-tui"
+path = "src/main.rs"
+
 [dependencies]
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 chrono = "0.4"
 futures = "0.3"
 # Fork of whisperfish/presage, branch storage-groups: adds Manager::sync_groups_from_storage_service.
@@ -12,11 +16,11 @@ presage = { git = "https://github.com/louisrubet/presage", rev = "85ff409f7c5b8c
 presage-store-sqlite = { git = "https://github.com/louisrubet/presage", rev = "85ff409f7c5b8cec91ba531a9c2b0a0e1687f43d" }
 tokio = { version = "1.48", features = ["macros", "rt", "time"] }
 url = "2.5"
-
-[dev-dependencies]
 base64 = "0.22"
 open = "5.3"
 qrcode = { version = "0.14", default-features = false }
+
+[dev-dependencies]
 tempfile = "3.9"
 
 # Same patch as the presage workspace: presage-store-sqlite needs this libsqlite3-sys fork for SQLCipher.
