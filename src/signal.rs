@@ -20,7 +20,9 @@ use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage::libsignal_service::prelude::Uuid;
+use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
 use presage::proto::data_message::Quote;
+use presage::proto::typing_message::Action as TypingAction;
 use presage::proto::sync_message::{Content as SyncContent, Sent};
 use presage::proto::{DataMessage, GroupContextV2, SyncMessage};
 use presage::store::ContentsStore;
@@ -207,18 +209,7 @@ pub async fn conversations(
 
     let mut conversations = Vec::new();
     for (thread, inbox_position, open) in threads {
-        let title = match &thread {
-            Thread::Group(key) => store.group(*key).await?.map(|g| g.title),
-            Thread::Contact(id) => store.contact_by_id(id).await?.and_then(|c| {
-                Some(c.name)
-                    .filter(|n| !n.is_empty())
-                    .or_else(|| c.phone_number.map(|p| p.to_string()))
-            }),
-        };
-        let title = title.unwrap_or_else(|| match &thread {
-            Thread::Group(_) => "<unknown group>".to_string(),
-            Thread::Contact(id) => id.service_id_string(),
-        });
+        let title = thread_title(manager, &thread).await?;
 
         let mut message_count = 0;
         let mut last_message = None;
@@ -262,9 +253,39 @@ fn data_message(content: &Content) -> Option<(&DataMessage, bool)> {
     }
 }
 
+/// Display name of a conversation: group title, contact name or phone number, and
+/// "Note to Self" for the conversation with our own account.
+pub async fn thread_title(manager: &SignalManager, thread: &Thread) -> Result<String, SqliteStoreError> {
+    let store = manager.store();
+    let title = match thread {
+        Thread::Contact(id) if id.raw_uuid() == manager.registration_data().service_ids.aci => {
+            Some("Note to Self".to_string())
+        }
+        Thread::Contact(id) => store.contact_by_id(id).await?.and_then(|c| {
+            Some(c.name)
+                .filter(|n| !n.is_empty())
+                .or_else(|| c.phone_number.map(|p| p.to_string()))
+        }),
+        Thread::Group(key) => store.group(*key).await?.map(|g| g.title),
+    };
+    Ok(title.unwrap_or_else(|| match thread {
+        Thread::Group(_) => "<unknown group>".to_string(),
+        Thread::Contact(id) => id.service_id_string(),
+    }))
+}
+
 /// Text of a message, whether received or sent by us from another device.
 fn message_text(content: &Content) -> Option<&str> {
     data_message(content)?.0.body.as_deref()
+}
+
+/// Someone started or stopped typing in a conversation.
+pub struct Typing {
+    pub thread: Thread,
+    /// ACI of the person typing, as in [`Message::author`].
+    pub author: String,
+    pub name: String,
+    pub started: bool,
 }
 
 /// Turns stored or received Signal messages into interface [`Message`]s.
@@ -272,6 +293,8 @@ pub struct Directory {
     own_aci: Uuid,
     /// Display names of the synchronized contacts.
     names: HashMap<Uuid, String>,
+    /// Typing messages name groups by identifier, threads by master key.
+    groups: HashMap<[u8; 32], [u8; 32]>,
 }
 
 impl Directory {
@@ -285,7 +308,39 @@ impl Directory {
                 names.insert(contact.uuid, name);
             }
         }
-        Ok(Directory { own_aci: manager.registration_data().service_ids.aci, names })
+        let mut groups = HashMap::new();
+        for (master_key, _) in manager.store().groups().await?.flatten() {
+            let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+            groups.insert(params.get_group_identifier(), master_key);
+        }
+        Ok(Directory { own_aci: manager.registration_data().service_ids.aci, names, groups })
+    }
+
+    /// Contact name, or the start of the ACI for strangers.
+    fn name_of(&self, aci: &Uuid) -> String {
+        match self.names.get(aci) {
+            Some(name) => name.clone(),
+            None => aci.to_string()[..8].to_string(),
+        }
+    }
+
+    /// The typing notification in `content`, if any (ours from other devices are ignored).
+    pub fn typing(&self, content: &Content) -> Option<Typing> {
+        let ContentBody::TypingMessage(typing) = &content.body else { return None };
+        let sender = content.metadata.sender.raw_uuid();
+        if sender == self.own_aci {
+            return None;
+        }
+        let thread = match &typing.group_id {
+            Some(group_id) => Thread::Group(*self.groups.get(group_id.as_slice())?),
+            None => Thread::Contact(content.metadata.sender),
+        };
+        Some(Typing {
+            thread,
+            author: sender.to_string(),
+            name: self.name_of(&sender),
+            started: typing.action() == TypingAction::Started,
+        })
     }
 
     /// The text message in `content`, with the id of the message it quotes.
@@ -296,10 +351,7 @@ impl Directory {
         let sender = content.metadata.sender.raw_uuid();
         let from_me = sent_elsewhere || sender == self.own_aci;
         let id = data.timestamp.unwrap_or_else(|| content.metadata.client_timestamp.timestamp_millis() as u64);
-        let sender_name = match self.names.get(&sender) {
-            Some(name) => name.clone(),
-            None => sender.to_string()[..8].to_string(),
-        };
+        let sender_name = self.name_of(&sender);
         let message = Message {
             id,
             author: Some(if from_me { self.own_aci } else { sender }.to_string()),

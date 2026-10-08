@@ -4,6 +4,7 @@
 //! [`Action`]s that the caller carries out (sending through Signal, or locally for the mock).
 
 use std::io::{self, Write, stdout};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use crossterm::{
@@ -81,9 +82,21 @@ impl Compose {
     }
 }
 
+/// Without news, someone is no longer shown typing after this (as Signal clients do).
+const TYPING_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Someone typing in a discussion, until `until`.
+struct Typing {
+    discussion: usize,
+    author: String,
+    name: String,
+    until: Instant,
+}
+
 pub struct App {
     pub discussions: Vec<Discussion>,
     pub settings: Settings,
+    typing: Vec<Typing>,
     screen: Screen,
     /// One-shot feedback shown in the footer until the next key press.
     status: Option<String>,
@@ -96,6 +109,7 @@ impl App {
         App {
             discussions,
             settings: Settings::default(),
+            typing: Vec::new(),
             screen: Screen::List { selected: 0, scroll: 0 },
             status: None,
             clipboard: None,
@@ -112,6 +126,25 @@ impl App {
         self.discussions.len() - 1
     }
 
+    /// `author` (named `name`) started or stopped typing in `discussion`.
+    pub fn set_typing(&mut self, discussion: usize, author: &str, name: &str, started: bool, now: Instant) {
+        self.typing.retain(|t| !(t.discussion == discussion && t.author == author));
+        if started {
+            let (author, name) = (author.to_string(), name.to_string());
+            self.typing.push(Typing { discussion, author, name, until: now + TYPING_TIMEOUT });
+        }
+    }
+
+    /// When the next typing indicator expires, to redraw then.
+    pub fn next_typing_expiry(&self) -> Option<Instant> {
+        self.typing.iter().map(|t| t.until).min()
+    }
+
+    /// Drops the typing indicators expired at `now`.
+    pub fn expire_typing(&mut self, now: Instant) {
+        self.typing.retain(|t| t.until > now);
+    }
+
     /// Whether `discussion` is the one shown (also while forwarding from it).
     pub fn is_open(&self, discussion: usize) -> bool {
         matches!(self.screen, Screen::Discussion { discussion_idx, .. } if discussion_idx == discussion)
@@ -125,6 +158,10 @@ impl App {
         let target = &mut self.discussions[discussion];
         let was_last = target.messages.len().saturating_sub(1);
         let from_me = message.from_me;
+        // Their message arrived: they are done typing it.
+        if let Some(author) = &message.author {
+            self.typing.retain(|t| !(t.discussion == discussion && t.author == *author));
+        }
         target.messages.push(message);
         let last = target.messages.len() - 1;
         if !open && !from_me {
@@ -312,10 +349,12 @@ impl App {
         if let Some(text) = self.clipboard.take() {
             copy_to_clipboard(out, &text)?;
         }
+        let typing: Vec<usize> = self.typing.iter().map(|t| t.discussion).collect();
         match &mut self.screen {
             Screen::List { selected, scroll } => draw_list(
                 out,
                 &self.discussions,
+                &typing,
                 "Discussions",
                 "\u{2191}/\u{2193} select discussion   Enter open   p parameters   q quit",
                 *selected,
@@ -326,6 +365,7 @@ impl App {
             Screen::Discussion { discussion_idx, selected_msg, scroll, composing } => draw_discussion(
                 out,
                 &self.discussions[*discussion_idx],
+                &self.typing.iter().filter(|t| t.discussion == *discussion_idx).map(|t| t.name.as_str()).collect::<Vec<_>>(),
                 *selected_msg,
                 scroll,
                 composing.as_ref(),
@@ -336,6 +376,7 @@ impl App {
             Screen::Forward { selected, scroll, .. } => draw_list(
                 out,
                 &self.discussions,
+                &typing,
                 "Forward to\u{2026}",
                 "\u{2191}/\u{2193} select discussion   Enter forward   Esc cancel",
                 *selected,
@@ -408,6 +449,8 @@ const FOOTER: usize = 1;
 fn draw_list(
     out: &mut impl Write,
     discussions: &[Discussion],
+    // Discussions where someone is typing.
+    typing: &[usize],
     title: &str,
     help: &str,
     selected: usize,
@@ -439,11 +482,12 @@ fn draw_list(
         let idx = *scroll + row;
         if idx < discussions.len() {
             let discussion = &discussions[idx];
+            let title = if typing.contains(&idx) { format!("{} ...", discussion.title) } else { discussion.title.clone() };
             // The star takes two columns but counts as one character: pad one less.
             let text = if discussion.unread {
-                format!("\u{2b50} {}", ui::pad_left(&discussion.title, width.saturating_sub(3)))
+                format!("\u{2b50} {}", ui::pad_left(&title, width.saturating_sub(3)))
             } else {
-                format!("   {}", ui::pad_left(&discussion.title, width.saturating_sub(3)))
+                format!("   {}", ui::pad_left(&title, width.saturating_sub(3)))
             };
             print_row(out, y, &text, idx == selected)?;
         } else {
@@ -480,6 +524,8 @@ fn draw_settings(
 fn draw_discussion(
     out: &mut impl Write,
     discussion: &Discussion,
+    // Names of the people typing.
+    typing: &[&str],
     selected_msg: usize,
     scroll: &mut usize,
     composing: Option<&Compose>,
@@ -529,7 +575,7 @@ fn draw_discussion(
     };
     let viewport = height.saturating_sub(HEADER + footer.len()).max(1);
 
-    let lines = ui::build_discussion_lines(discussion, width);
+    let mut lines = ui::build_discussion_lines(discussion, width);
 
     let mut sel_min = None;
     let mut sel_max = None;
@@ -540,7 +586,18 @@ fn draw_discussion(
         }
     }
     let sel_min = sel_min.unwrap_or(0);
-    let sel_max = sel_max.unwrap_or(0);
+    let mut sel_max = sel_max.unwrap_or(0);
+
+    // "Name ..." under the last message while someone types, kept in view with it.
+    if !typing.is_empty() {
+        if !lines.is_empty() {
+            lines.push(ui::RenderLine { msg_idx: None, kind: ui::LineKind::Left(String::new()) });
+        }
+        lines.push(ui::RenderLine { msg_idx: None, kind: ui::LineKind::Left(format!("{} ...", typing.join(", "))) });
+        if selected_msg + 1 >= discussion.messages.len() {
+            sel_max = lines.len() - 1;
+        }
+    }
 
     if sel_min < *scroll {
         *scroll = sel_min;
@@ -686,6 +743,47 @@ mod tests {
         assert!(!app.settings.notifications);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(1)), "back on the same discussion");
+    }
+
+    /// The screen as text (escape sequences dropped), for rendering checks.
+    fn screen(app: &mut App) -> String {
+        let mut out = Vec::new();
+        app.draw(&mut out, 80, 30).unwrap();
+        let raw = String::from_utf8(out).unwrap();
+        let mut text = String::new();
+        let mut chars = raw.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // CSI sequence: skip up to its final letter.
+                chars.by_ref().find(|c| c.is_ascii_alphabetic());
+            } else {
+                text.push(c);
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn typing_is_shown_until_message_stop_or_timeout() {
+        let now = Instant::now();
+        let mut app = app();
+        app.set_typing(1, "dad", "Dad", true, now);
+        assert!(screen(&mut app).contains("Family Group ..."));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(screen(&mut app).contains("Dad ..."));
+
+        let message = Message { from_me: false, author: Some("dad".to_string()), ..Message::mine(1, "hi".to_string(), None, false) };
+        app.push_message(1, message);
+        assert!(!screen(&mut app).contains("Dad ..."), "the message replaces the indicator");
+
+        app.set_typing(1, "mom", "Mom", true, now);
+        app.set_typing(1, "mom", "Mom", false, now);
+        assert_eq!(app.next_typing_expiry(), None, "stopped");
+
+        app.set_typing(1, "mom", "Mom", true, now);
+        app.expire_typing(now + TYPING_TIMEOUT);
+        assert!(!screen(&mut app).contains("Mom ..."), "expired");
     }
 
     #[test]

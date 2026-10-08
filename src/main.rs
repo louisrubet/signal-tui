@@ -9,7 +9,7 @@
 use std::error::Error;
 use std::io::{Write, stdout};
 use std::pin::pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream};
 use crossterm::terminal;
@@ -82,7 +82,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
         app.draw(&mut out, w, h)?;
         out.flush()?;
 
+        let typing_expiry = app.next_typing_expiry();
         tokio::select! {
+            _ = tokio::time::sleep_until(typing_expiry.unwrap_or_else(Instant::now).into()), if typing_expiry.is_some() => {
+                app.expire_typing(Instant::now());
+            }
             event = keys.next() => {
                 let Some(event) = event else { break };
                 let action = match event? {
@@ -137,6 +141,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     continue;
                 };
                 let Received::Content(content) = received else { continue };
+                if let Some(typing) = directory.typing(&content) {
+                    if let Some(idx) = threads.iter().position(|t| *t == typing.thread) {
+                        app.set_typing(idx, &typing.author, &typing.name, typing.started, Instant::now());
+                    }
+                    continue;
+                }
                 let Ok(thread) = Thread::try_from(&*content) else { continue };
                 let is_group = matches!(thread, Thread::Group(_));
                 if directory.to_message(&content).is_none() {
@@ -146,8 +156,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     Some(idx) => idx,
                     None => {
                         // A conversation we did not list yet (e.g. someone not in the contacts).
-                        let title = manager.thread_title(&thread).await.unwrap_or_default();
-                        let title = if title.is_empty() { thread.to_string() } else { title };
+                        let title = signal::thread_title(&manager, &thread).await.unwrap_or_else(|_| thread.to_string());
                         threads.push(thread);
                         app.push_discussion(Discussion::new(title))
                     }
