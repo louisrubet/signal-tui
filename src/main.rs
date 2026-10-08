@@ -16,7 +16,7 @@ use crossterm::terminal;
 use futures::StreamExt;
 use signal_tui::data::{Discussion, Message};
 use signal_tui::settings::Settings;
-use signal_tui::signal::{self, Directory, ReadMarks, Thread};
+use signal_tui::signal::{self, Directory, Pins, ReadMarks, Thread};
 use signal_tui::tui::{Action, App, TerminalGuard};
 use signal_tui::qr;
 use presage::model::messages::Received;
@@ -62,8 +62,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let directory = Directory::load(&manager).await?;
     let (mut threads, mut discussions) = signal::load_discussions(&manager, &directory, &conversations).await?;
     let mut read_marks = ReadMarks::load(path.with_extension("read"));
+    let mut pins = Pins::load(path.with_extension("pinned"));
     for (thread, discussion) in threads.iter().zip(&mut discussions) {
         discussion.unread = read_marks.is_unread(thread, discussion);
+        discussion.pinned = pins.rank(thread);
     }
     let mut app = App::new(discussions);
     let settings_path = Settings::default_path()?;
@@ -101,6 +103,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
                 let (discussion, text, reply_to, forwarded) = match action {
                     Action::Quit => break,
+                    Action::PinToggled(idx) => {
+                        if let Err(e) = pins.set(&threads[idx], app.discussions[idx].pinned.is_some()) {
+                            app.set_status(format!("Cannot save the pinned chats: {e}"));
+                        }
+                        continue;
+                    }
                     Action::SettingsChanged => {
                         if let Err(e) = app.settings.save(&settings_path) {
                             app.set_status(format!("Cannot save the parameters: {e}"));

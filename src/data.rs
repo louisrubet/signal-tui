@@ -35,11 +35,14 @@ pub struct Discussion {
     pub messages: Vec<Message>,
     /// Has messages received since it was last opened.
     pub unread: bool,
+    /// Rank in the "Pinned" list (pin order: a chat pinned later comes after); `None` when
+    /// not pinned.
+    pub pinned: Option<u32>,
 }
 
 impl Discussion {
     pub fn new(title: String) -> Self {
-        Discussion { title, messages: Vec::new(), unread: false }
+        Discussion { title, messages: Vec::new(), unread: false, pinned: None }
     }
 
     /// Index of the message with this Signal id.
@@ -80,6 +83,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
         Discussion {
             title: "Alice Martin".to_string(),
             unread: false,
+            pinned: Some(0),
             messages: vec![
                 msg(false, "Alice Martin", "Hey! Are we still on for tomorrow?", "2026-07-15 09:12"),
                 msg(true, "", "Yes, absolutely. What time works for you?", "2026-07-15 09:15"),
@@ -94,6 +98,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
         Discussion {
             title: "Family Group".to_string(),
             unread: true,
+            pinned: None,
             messages: vec![
                 msg(false, "Mom", "Don't forget dinner on Sunday.", "2026-07-13 12:00"),
                 msg(false, "Dad", "I'll bring the wine.", "2026-07-13 12:03"),
@@ -104,6 +109,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
         Discussion {
             title: "Bob Dupont".to_string(),
             unread: false,
+            pinned: None,
             messages: vec![
                 msg(false, "Bob Dupont", "Did you push the fix?", "2026-07-17 10:00"),
                 msg(true, "", "Yep, just pushed it.", "2026-07-17 10:01"),
@@ -120,6 +126,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
         Discussion {
             title: "Chloe Renard".to_string(),
             unread: false,
+            pinned: None,
             messages: vec![
                 msg(false, "Chloe Renard", "Happy birthday!! 🎉", "2026-06-01 07:30"),
                 msg(true, "", "Thank you so much!", "2026-06-01 08:15"),

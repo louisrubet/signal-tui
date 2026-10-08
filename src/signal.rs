@@ -421,6 +421,38 @@ impl ReadMarks {
     }
 }
 
+/// The pinned conversations, in pin order, kept in a small text file next to the store:
+/// one per line.
+pub struct Pins {
+    path: PathBuf,
+    keys: Vec<String>,
+}
+
+impl Pins {
+    /// Loads the pins; a missing file means nothing is pinned.
+    pub fn load(path: PathBuf) -> Self {
+        let keys = std::fs::read_to_string(&path).unwrap_or_default().lines().map(str::to_string).collect();
+        Pins { path, keys }
+    }
+
+    /// Rank of `thread` in the pinned list, if pinned.
+    pub fn rank(&self, thread: &Thread) -> Option<u32> {
+        let key = thread_key(thread);
+        self.keys.iter().position(|k| *k == key).map(|rank| rank as u32)
+    }
+
+    /// Pins `thread` at the end of the list, or unpins it, and saves.
+    pub fn set(&mut self, thread: &Thread, pinned: bool) -> std::io::Result<()> {
+        let key = thread_key(thread);
+        self.keys.retain(|k| *k != key);
+        if pinned {
+            self.keys.push(key);
+        }
+        let content: String = self.keys.iter().map(|key| format!("{key}\n")).collect();
+        std::fs::write(&self.path, content)
+    }
+}
+
 /// Stable text key of a conversation.
 fn thread_key(thread: &Thread) -> String {
     match thread {

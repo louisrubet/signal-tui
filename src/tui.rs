@@ -35,9 +35,12 @@ pub enum Action {
     Forward { from: usize, msg: usize, to: usize },
     /// [`App::settings`] changed: save them.
     SettingsChanged,
+    /// The discussion was pinned or unpinned ([`Discussion::pinned`]): save it.
+    PinToggled(usize),
 }
 
 enum Screen {
+    /// The chats. `selected` is a discussion index (here and in `Forward`).
     List {
         selected: usize,
         scroll: usize,
@@ -106,11 +109,12 @@ pub struct App {
 
 impl App {
     pub fn new(discussions: Vec<Discussion>) -> Self {
+        let first = order(&discussions).first().copied().unwrap_or(0);
         App {
             discussions,
             settings: Settings::default(),
             typing: Vec::new(),
-            screen: Screen::List { selected: 0, scroll: 0 },
+            screen: Screen::List { selected: first, scroll: 0 },
             status: None,
             clipboard: None,
         }
@@ -193,11 +197,18 @@ impl App {
 
         match &mut self.screen {
             Screen::List { selected, .. } => match key.code {
-                KeyCode::Up => *selected = selected.saturating_sub(1),
-                KeyCode::Down => {
-                    if *selected + 1 < discussions.len() {
-                        *selected += 1;
-                    }
+                KeyCode::Up => *selected = step(discussions, *selected, -1),
+                KeyCode::Down => *selected = step(discussions, *selected, 1),
+                KeyCode::Char('P') if *selected < discussions.len() => {
+                    let idx = *selected;
+                    // Pinning again puts the chat at the end of the pinned list.
+                    let next_rank = self.discussions.iter().filter_map(|d| d.pinned).max().map_or(0, |r| r + 1);
+                    let discussion = &mut self.discussions[idx];
+                    discussion.pinned = match discussion.pinned {
+                        Some(_) => None,
+                        None => Some(next_rank),
+                    };
+                    return Some(Action::PinToggled(idx));
                 }
                 KeyCode::Char('p') => {
                     let back_to = *selected;
@@ -294,12 +305,8 @@ impl App {
                 }
             }
             Screen::Forward { discussion_idx, msg_idx, selected, .. } => match key.code {
-                KeyCode::Up => *selected = selected.saturating_sub(1),
-                KeyCode::Down => {
-                    if *selected + 1 < discussions.len() {
-                        *selected += 1;
-                    }
-                }
+                KeyCode::Up => *selected = step(discussions, *selected, -1),
+                KeyCode::Down => *selected = step(discussions, *selected, 1),
                 KeyCode::Enter => {
                     let action = Action::Forward { from: *discussion_idx, msg: *msg_idx, to: *selected };
                     let (discussion_idx, selected_msg) = (*discussion_idx, *msg_idx);
@@ -355,8 +362,8 @@ impl App {
                 out,
                 &self.discussions,
                 &typing,
-                "Discussions",
-                "\u{2191}/\u{2193} select discussion   Enter open   p parameters   q quit",
+                None,
+                "\u{2191}/\u{2193} select chat   Enter open   P pin/unpin   p parameters   q quit",
                 *selected,
                 scroll,
                 w,
@@ -377,8 +384,8 @@ impl App {
                 out,
                 &self.discussions,
                 &typing,
-                "Forward to\u{2026}",
-                "\u{2191}/\u{2193} select discussion   Enter forward   Esc cancel",
+                Some("Forward to\u{2026}"),
+                "\u{2191}/\u{2193} select chat   Enter forward   Esc cancel",
                 *selected,
                 scroll,
                 w,
@@ -445,13 +452,64 @@ fn print_row(out: &mut impl Write, y: u16, text: &str, selected: bool) -> io::Re
 const HEADER: usize = 2;
 const FOOTER: usize = 1;
 
+/// Discussion indices in display order: pinned first (in pin order), then the others.
+fn order(discussions: &[Discussion]) -> Vec<usize> {
+    let (mut pinned, others): (Vec<usize>, Vec<usize>) =
+        (0..discussions.len()).partition(|&i| discussions[i].pinned.is_some());
+    pinned.sort_by_key(|&i| discussions[i].pinned);
+    pinned.into_iter().chain(others).collect()
+}
+
+/// The discussion `delta` places away from `selected` in display order (clamped).
+fn step(discussions: &[Discussion], selected: usize, delta: isize) -> usize {
+    let order = order(discussions);
+    let Some(pos) = order.iter().position(|&i| i == selected) else { return order.first().copied().unwrap_or(0) };
+    order[pos.saturating_add_signed(delta).min(order.len() - 1)]
+}
+
+/// A line of the chat list.
+enum Row<'a> {
+    Title(&'a str),
+    Blank,
+    Chat(usize),
+}
+
+/// The list lines: one `title` section, or "Pinned" and "Chats" sections (only "Chats"
+/// when nothing is pinned).
+fn list_rows<'a>(discussions: &[Discussion], title: Option<&'a str>) -> Vec<Row<'a>> {
+    let order = order(discussions);
+    let pinned_count = discussions.iter().filter(|d| d.pinned.is_some()).count();
+    let mut rows = Vec::new();
+    let section = |rows: &mut Vec<Row<'a>>, title: &'a str, chats: &[usize]| {
+        if !rows.is_empty() {
+            rows.push(Row::Blank);
+        }
+        rows.push(Row::Title(title));
+        rows.push(Row::Blank);
+        rows.extend(chats.iter().map(|&i| Row::Chat(i)));
+    };
+    match title {
+        Some(title) => section(&mut rows, title, &order),
+        None => {
+            if pinned_count > 0 {
+                section(&mut rows, "Pinned", &order[..pinned_count]);
+            }
+            if pinned_count == 0 || pinned_count < order.len() {
+                section(&mut rows, "Chats", &order[pinned_count..]);
+            }
+        }
+    }
+    rows
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_list(
     out: &mut impl Write,
     discussions: &[Discussion],
     // Discussions where someone is typing.
     typing: &[usize],
-    title: &str,
+    // Single section title; `None` for the "Pinned" / "Chats" sections.
+    title: Option<&str>,
     help: &str,
     selected: usize,
     scroll: &mut usize,
@@ -460,39 +518,44 @@ fn draw_list(
 ) -> io::Result<()> {
     let width = w as usize;
     let height = h as usize;
-    let viewport = height.saturating_sub(HEADER + FOOTER).max(1);
+    let viewport = height.saturating_sub(FOOTER).max(1);
+    let rows = list_rows(discussions, title);
 
-    if selected < *scroll {
-        *scroll = selected;
+    // Keep the selected chat in view, with its section title when it is the first one.
+    let sel_row = rows.iter().position(|r| matches!(r, Row::Chat(i) if *i == selected)).unwrap_or(0);
+    let mut top = sel_row;
+    while top > 0 && !matches!(rows[top - 1], Row::Chat(_)) {
+        top -= 1;
     }
-    if selected >= *scroll + viewport {
-        *scroll = selected + 1 - viewport;
+    if top < *scroll {
+        *scroll = top;
     }
-    let max_scroll = discussions.len().saturating_sub(viewport);
-    if *scroll > max_scroll {
-        *scroll = max_scroll;
+    if sel_row >= *scroll + viewport {
+        *scroll = sel_row + 1 - viewport;
     }
+    *scroll = (*scroll).min(rows.len().saturating_sub(viewport));
 
     queue!(out, Clear(ClearType::All), cursor::Hide)?;
-    print_row(out, 0, &ui::pad_left(title, width), false)?;
-    print_row(out, 1, &" ".repeat(width), false)?;
-
-    for row in 0..viewport {
-        let y = (HEADER + row) as u16;
-        let idx = *scroll + row;
-        if idx < discussions.len() {
-            let discussion = &discussions[idx];
-            let title = if typing.contains(&idx) { format!("{} ...", discussion.title) } else { discussion.title.clone() };
-            // The star takes two columns but counts as one character: pad one less.
-            let text = if discussion.unread {
-                format!("\u{2b50} {}", ui::pad_left(&title, width.saturating_sub(3)))
-            } else {
-                format!("   {}", ui::pad_left(&title, width.saturating_sub(3)))
-            };
-            print_row(out, y, &text, idx == selected)?;
-        } else {
-            print_row(out, y, &" ".repeat(width), false)?;
-        }
+    for y in 0..viewport {
+        let text = match rows.get(*scroll + y) {
+            Some(Row::Title(title)) => ui::pad_left(title, width),
+            Some(Row::Chat(idx)) => {
+                let idx = *idx;
+                let discussion = &discussions[idx];
+                let title =
+                    if typing.contains(&idx) { format!("{} ...", discussion.title) } else { discussion.title.clone() };
+                // The star takes two columns but counts as one character: pad one less.
+                let text = if discussion.unread {
+                    format!("\u{2b50} {}", ui::pad_left(&title, width.saturating_sub(3)))
+                } else {
+                    format!("   {}", ui::pad_left(&title, width.saturating_sub(3)))
+                };
+                print_row(out, y as u16, &text, idx == selected)?;
+                continue;
+            }
+            Some(Row::Blank) | None => " ".repeat(width),
+        };
+        print_row(out, y as u16, &text, false)?;
     }
 
     print_row(out, (height - 1) as u16, &ui::pad_left(help, width), false)?;
@@ -784,6 +847,57 @@ mod tests {
         app.set_typing(1, "mom", "Mom", true, now);
         app.expire_typing(now + TYPING_TIMEOUT);
         assert!(!screen(&mut app).contains("Mom ..."), "expired");
+    }
+
+    #[test]
+    fn pinned_chats_come_first_in_their_own_list() {
+        let mut app = app();
+        let text = screen(&mut app);
+        assert!(text.find("Pinned").unwrap() < text.find("Alice Martin").unwrap());
+        assert!(text.find("Alice Martin").unwrap() < text.find("Chats").unwrap());
+
+        // Pin Bob (index 2): it moves to the pinned list, and the selection follows it.
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.handle_key(key(KeyCode::Char('P'))), Some(Action::PinToggled(2)));
+        let text = screen(&mut app);
+        assert!(text.find("Bob Dupont").unwrap() < text.find("Chats").unwrap());
+        // Display order is now Alice, Bob, Family Group, Chloe.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(1)));
+    }
+
+    #[test]
+    fn pinning_again_goes_to_the_end_of_the_pinned_list() {
+        let mut app = app();
+        let pinned = |app: &mut App| {
+            let text = screen(app);
+            let end = text.find("Chats").unwrap();
+            let mut names: Vec<(usize, &str)> = ["Alice Martin", "Family Group", "Bob Dupont", "Chloe Renard"]
+                .into_iter()
+                .filter_map(|n| text[..end].find(n).map(|at| (at, n)))
+                .collect();
+            names.sort();
+            names.into_iter().map(|(_, n)| n).collect::<Vec<_>>()
+        };
+        // Pin Family Group: [Alice, Family]. Unpin then re-pin Alice: [Family, Alice].
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char('P')));
+        assert_eq!(pinned(&mut app), ["Alice Martin", "Family Group"]);
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Char('P')));
+        assert_eq!(pinned(&mut app), ["Family Group"]);
+        app.handle_key(key(KeyCode::Char('P')));
+        assert_eq!(pinned(&mut app), ["Family Group", "Alice Martin"]);
+    }
+
+    #[test]
+    fn without_pinned_chats_only_chats_are_listed() {
+        let mut app = app();
+        app.handle_key(key(KeyCode::Char('P')));
+        let text = screen(&mut app);
+        assert!(!text.contains("Pinned"));
+        assert!(text.contains("Chats"));
     }
 
     #[test]

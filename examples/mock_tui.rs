@@ -30,7 +30,7 @@ fn main() -> io::Result<()> {
         };
         match action {
             Some(Action::Quit) => return Ok(()),
-            Some(Action::Opened(_) | Action::SettingsChanged) => {}
+            Some(Action::Opened(_) | Action::SettingsChanged | Action::PinToggled(_)) => {}
             Some(Action::Send { discussion, text, reply_to }) => {
                 app.push_message(discussion, Message::mine(next_id, text, reply_to, false));
                 next_id += 1;
