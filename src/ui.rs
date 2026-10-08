@@ -59,11 +59,15 @@ fn char_boundary(s: &str, n: usize) -> usize {
     s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
 }
 
-/// Greedy word-wrap. Words longer than `width` are hard-broken.
+/// Greedy word-wrap, keeping the line breaks of `text`. Words longer than `width` are hard-broken.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
+    text.lines().flat_map(|line| wrap_line(line, width)).collect()
+}
+
+fn wrap_line(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
@@ -160,4 +164,15 @@ pub fn build_discussion_lines(discussion: &Discussion, width: usize) -> Vec<Rend
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_text;
+
+    #[test]
+    fn wrap_keeps_line_breaks() {
+        assert_eq!(wrap_text("one two\n\nthree", 20), vec!["one two", "", "three"]);
+        assert_eq!(wrap_text("aaa bbb\nccc", 4), vec!["aaa", "bbb", "ccc"]);
+    }
 }

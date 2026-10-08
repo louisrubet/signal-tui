@@ -4,7 +4,10 @@ use base64::Engine;
 
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{
+        self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute, queue,
     style::{Attribute, Print, SetAttribute},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -45,9 +48,17 @@ fn main() -> io::Result<()> {
     terminal::enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, cursor::Hide)?;
+    // Lets the terminal report Shift+Enter distinctly from Enter (kitty keyboard protocol).
+    let enhanced_keys = terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced_keys {
+        execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
+    }
 
     let result = run(&mut out, &mut discussions);
 
+    if enhanced_keys {
+        execute!(out, PopKeyboardEnhancementFlags)?;
+    }
     execute!(out, cursor::Show, LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
 
@@ -126,6 +137,10 @@ fn run(out: &mut impl Write, discussions: &mut Vec<Discussion>) -> io::Result<()
                 if let Some(compose) = composing {
                     match key.code {
                         KeyCode::Esc => *composing = None,
+                        // Shift+Enter needs the kitty keyboard protocol; Alt+Enter works everywhere.
+                        KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+                            compose.buffer.push('\n')
+                        }
                         KeyCode::Enter => {
                             let text = compose.buffer.trim();
                             if !text.is_empty() {
@@ -301,6 +316,12 @@ fn draw_list(
     Ok(())
 }
 
+/// Last `n` characters of `s`, so the end of what is being typed stays visible.
+fn tail(s: &str, n: usize) -> &str {
+    let skip = s.chars().count().saturating_sub(n);
+    s.char_indices().nth(skip).map_or("", |(i, _)| &s[i..])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_discussion(
     out: &mut impl Write,
@@ -314,7 +335,40 @@ fn draw_discussion(
 ) -> io::Result<()> {
     let width = w as usize;
     let height = h as usize;
-    let viewport = height.saturating_sub(HEADER + FOOTER).max(1);
+
+    // Footer: the help/status line, or the compose area with one row per line of the draft
+    // (at most half the screen, showing the end of the draft).
+    let mut cursor_pos = None;
+    let footer: Vec<String> = match composing {
+        Some(Compose { buffer, reply_to }) => {
+            let prompt = match reply_to.and_then(|i| discussion.messages.get(i)) {
+                Some(m) if m.from_me => "Reply to yourself> ".to_string(),
+                Some(m) => format!("Reply to {}> ", m.sender_name),
+                None => "> ".to_string(),
+            };
+            let indent = " ".repeat(prompt.chars().count());
+            let avail = width.saturating_sub(indent.len());
+            let max_rows = (height.saturating_sub(HEADER) / 2).max(1);
+            let draft: Vec<&str> = buffer.split('\n').collect();
+            let first = draft.len().saturating_sub(max_rows);
+            let rows: Vec<String> = draft[first..]
+                .iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let lead = if first + i == 0 { &prompt } else { &indent };
+                    format!("{lead}{}", tail(line, avail))
+                })
+                .collect();
+            let last = rows.last().map_or(0, |r| r.chars().count());
+            cursor_pos = Some((last.min(width.saturating_sub(1)), rows.len() - 1));
+            rows
+        }
+        None => {
+            let help = "\u{2191}/\u{2193} navigate   r reply   f forward   c copy   o open links   Enter new message   Esc back   q quit";
+            vec![status.unwrap_or(help).to_string()]
+        }
+    };
+    let viewport = height.saturating_sub(HEADER + footer.len()).max(1);
 
     let lines = ui::build_discussion_lines(discussion, width);
 
@@ -357,29 +411,12 @@ fn draw_discussion(
         }
     }
 
-    let bottom_y = (height - 1) as u16;
-    match composing {
-        Some(Compose { buffer, reply_to }) => {
-            let prompt = match reply_to.and_then(|i| discussion.messages.get(i)) {
-                Some(m) if m.from_me => "Reply to yourself> ".to_string(),
-                Some(m) => format!("Reply to {}> ", m.sender_name),
-                None => "> ".to_string(),
-            };
-            let avail = width.saturating_sub(prompt.chars().count());
-            let shown: String = if buffer.chars().count() <= avail {
-                buffer.to_string()
-            } else {
-                buffer.chars().rev().take(avail).collect::<Vec<_>>().into_iter().rev().collect()
-            };
-            let line = format!("{prompt}{shown}");
-            let cursor_col = line.chars().count().min(width.saturating_sub(1)) as u16;
-            print_row(out, bottom_y, &ui::pad_left(&line, width), false)?;
-            queue!(out, cursor::MoveTo(cursor_col, bottom_y), cursor::Show)?;
-        }
-        None => {
-            let help = "\u{2191}/\u{2193} navigate   r reply   f forward   c copy   o open links   Enter new message   Esc back   q quit";
-            print_row(out, bottom_y, &ui::pad_left(status.unwrap_or(help), width), false)?;
-        }
+    let footer_y = height.saturating_sub(footer.len());
+    for (row, text) in footer.iter().enumerate() {
+        print_row(out, (footer_y + row) as u16, &ui::pad_left(text, width), false)?;
+    }
+    if let Some((col, row)) = cursor_pos {
+        queue!(out, cursor::MoveTo(col as u16, (footer_y + row) as u16), cursor::Show)?;
     }
     Ok(())
 }
