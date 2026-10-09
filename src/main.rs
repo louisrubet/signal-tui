@@ -64,7 +64,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let mut read_marks = ReadMarks::load(path.with_extension("read"));
     let mut pins = Pins::load(path.with_extension("pinned"));
     for (thread, discussion) in threads.iter().zip(&mut discussions) {
-        discussion.unread = read_marks.is_unread(thread, discussion);
+        discussion.unread = read_marks.unread_count(thread, discussion);
         discussion.pinned = pins.rank(thread);
     }
     let mut app = App::new(discussions);

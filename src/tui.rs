@@ -55,6 +55,8 @@ enum Screen {
         composing: Option<Compose>,
         /// `Some` while picking a reaction: the shortcode typed so far.
         reacting: Option<String>,
+        /// Index and number of the messages that were new when it was opened.
+        new_from: Option<(usize, usize)>,
     },
     /// Picking the discussion to forward a message to.
     Forward {
@@ -195,7 +197,7 @@ impl App {
         target.messages.push(message);
         let last = target.messages.len() - 1;
         if !open && !from_me {
-            target.unread = true;
+            target.unread += 1;
         }
         if let Screen::Discussion { discussion_idx, selected_msg, .. } = &mut self.screen
             && *discussion_idx == discussion
@@ -214,14 +216,18 @@ impl App {
             && key.code == KeyCode::Enter
             && selected < self.discussions.len()
         {
-            let last_msg = self.discussions[selected].messages.len().saturating_sub(1);
-            self.discussions[selected].unread = false;
+            // Opens on the first new message, below a "N new messages" line.
+            let discussion = &mut self.discussions[selected];
+            let new_from = discussion.first_unread().map(|first| (first, discussion.unread));
+            let selected_msg = new_from.map_or(discussion.messages.len().saturating_sub(1), |(first, _)| first);
+            discussion.unread = 0;
             self.screen = Screen::Discussion {
                 discussion_idx: selected,
-                selected_msg: last_msg,
+                selected_msg,
                 scroll: 0,
                 composing: None,
                 reacting: None,
+                new_from,
             };
             return Some(Action::Opened(selected));
         }
@@ -383,13 +389,13 @@ impl App {
                     let action = Action::Forward { from: *discussion_idx, msg: *msg_idx, to: *selected };
                     let (discussion_idx, selected_msg) = (*discussion_idx, *msg_idx);
                     self.screen =
-                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None };
+                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None, new_from: None };
                     return Some(action);
                 }
                 KeyCode::Esc => {
                     let (discussion_idx, selected_msg) = (*discussion_idx, *msg_idx);
                     self.screen =
-                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None };
+                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None, new_from: None };
                 }
                 _ => {}
             },
@@ -444,10 +450,11 @@ impl App {
                 w,
                 h,
             ),
-            Screen::Discussion { discussion_idx, selected_msg, scroll, composing, reacting } => {
+            Screen::Discussion { discussion_idx, selected_msg, scroll, composing, reacting, new_from } => {
                 let visible = draw_discussion(
                     out,
                     &self.discussions[*discussion_idx],
+                    *new_from,
                     &self.typing.iter().filter(|t| t.discussion == *discussion_idx).map(|t| t.name.as_str()).collect::<Vec<_>>(),
                     *selected_msg,
                     scroll,
@@ -541,6 +548,18 @@ fn order(discussions: &[Discussion]) -> Vec<usize> {
     pinned.into_iter().chain(others).collect()
 }
 
+/// `n` new messages as a circled number (① to ㊿), "50+" beyond, nothing for none.
+fn unread_badge(n: usize) -> String {
+    let circled = match n {
+        0 => return String::new(),
+        1..=20 => 0x2460 + n - 1,
+        21..=35 => 0x3251 + n - 21,
+        36..=50 => 0x32b1 + n - 36,
+        _ => return "50+".to_string(),
+    };
+    char::from_u32(circled as u32).map_or_else(|| n.to_string(), String::from)
+}
+
 /// The discussion `delta` places away from `selected` in display order (clamped).
 fn step(discussions: &[Discussion], selected: usize, delta: isize) -> usize {
     let order = order(discussions);
@@ -625,12 +644,12 @@ fn draw_list(
                 let discussion = &discussions[idx];
                 let title =
                     if typing.contains(&idx) { format!("{} ...", discussion.title) } else { discussion.title.clone() };
-                // "⭐ " and the blank prefix both take three columns.
-                let text = if discussion.unread {
-                    format!("\u{2b50} {}", ui::pad_left(&title, width.saturating_sub(3)))
-                } else {
-                    format!("   {}", ui::pad_left(&title, width.saturating_sub(3)))
-                };
+                // Number of new messages in front, right-aligned in a 4-column prefix: "  ③ ", "50+ ".
+                let text = format!(
+                    "{} {}",
+                    ui::pad_right(&unread_badge(discussion.unread), 3),
+                    ui::pad_left(&title, width.saturating_sub(4))
+                );
                 print_row(out, y as u16, &text, idx == selected)?;
                 continue;
             }
@@ -668,6 +687,8 @@ fn draw_settings(
 fn draw_discussion(
     out: &mut impl Write,
     discussion: &Discussion,
+    // Where the "N new messages" line goes (index, count).
+    new_from: Option<(usize, usize)>,
     // Names of the people typing.
     typing: &[&str],
     selected_msg: usize,
@@ -734,7 +755,7 @@ fn draw_discussion(
     };
     let viewport = height.saturating_sub(HEADER + footer.len()).max(1);
 
-    let mut lines = ui::build_discussion_lines(discussion, width);
+    let mut lines = ui::build_discussion_lines(discussion, width, new_from);
 
     let mut sel_min = None;
     let mut sel_max = None;
@@ -1070,24 +1091,44 @@ mod tests {
     }
 
     #[test]
+    fn unread_badges() {
+        assert_eq!(unread_badge(0), "");
+        assert_eq!(unread_badge(1), "\u{2460}");
+        assert_eq!(unread_badge(20), "\u{2473}");
+        assert_eq!(unread_badge(21), "\u{3251}");
+        assert_eq!(unread_badge(50), "\u{32bf}");
+        assert_eq!(unread_badge(51), "50+");
+    }
+
+    #[test]
     fn received_messages_mark_other_discussions_unread() {
         let mut app = opened();
         let received = || Message { from_me: false, ..Message::mine(1, "hi".to_string(), None, false) };
         app.push_message(0, received());
         app.push_message(2, received());
         app.push_message(3, Message::mine(2, "sent".to_string(), None, false));
-        assert!(!app.discussions[0].unread, "open discussion stays read");
-        assert!(app.discussions[2].unread);
-        assert!(!app.discussions[3].unread, "own messages are not updates");
+        app.push_message(2, received());
+        assert_eq!(app.discussions[0].unread, 0, "open discussion stays read");
+        assert_eq!(app.discussions[2].unread, 2);
+        assert_eq!(app.discussions[3].unread, 0, "own messages are not updates");
     }
 
     #[test]
     fn opening_a_discussion_reads_it() {
         let mut app = app();
         app.handle_key(key(KeyCode::Down));
-        assert!(app.discussions[1].unread);
+        assert_eq!(app.discussions[1].unread, 2);
+        assert!(screen(&mut app).contains("\u{2461} Family Group"), "count in a circle");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(1)));
-        assert!(!app.discussions[1].unread);
+        assert_eq!(app.discussions[1].unread, 0);
+        // A line above the first new message, which is selected.
+        let text = screen(&mut app);
+        assert!(text.find("2 new messages").unwrap() < text.find("I'll bring the wine.").unwrap());
+        assert!(text.find("Don't forget dinner").unwrap() < text.find("2 new messages").unwrap());
+        app.handle_key(key(KeyCode::Char('r')));
+        type_text(&mut app, "x");
+        let send = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(send, Some(Action::Send { discussion: 1, text: "x".to_string(), reply_to: Some(1) }));
     }
 
     #[test]
