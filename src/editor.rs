@@ -1,21 +1,108 @@
-//! Multi-line text being typed, with a cursor.
+//! Multi-line text being typed, with a cursor and formatting.
+//!
+//! `**bold**`, `*italic*` and `~strikethrough~` are applied when their closing marker is
+//! typed: the markers go and the text keeps the style ([`Editor::styles`]).
+
+use std::ops::Range;
+
+use crate::data::{Style, Styled};
 
 #[derive(Default)]
 pub struct Editor {
     text: String,
     /// Byte index in `text`, always on a char boundary.
     cursor: usize,
+    /// Formatting of `text`.
+    styles: Vec<Styled>,
+    /// The state before the last formatting, kept while nothing changed since.
+    undo: Option<Undo>,
 }
+
+struct Undo {
+    text: String,
+    cursor: usize,
+    styles: Vec<Styled>,
+    /// What the formatting gave, to check nothing changed since.
+    after: (String, usize),
+}
+
+/// Formatting markers, longest first so that `**` is not taken for two `*`.
+const MARKERS: [(&str, Style); 3] = [("**", Style::Bold), ("*", Style::Italic), ("~", Style::Strikethrough)];
 
 impl Editor {
     /// An editor holding `text`, cursor at the end.
     pub fn new(text: &str) -> Self {
         let text = normalize_newlines(text);
-        Editor { cursor: text.len(), text }
+        Editor { cursor: text.len(), text, ..Default::default() }
     }
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    pub fn styles(&self) -> &[Styled] {
+        &self.styles
+    }
+
+    /// Replaces `range` of the text by `with`, keeping the styles on the same characters:
+    /// text inserted inside a styled range takes its style, not at its edges.
+    fn splice(&mut self, range: Range<usize>, with: &str) {
+        let (at, removed, added) = (range.start, range.len(), with.len());
+        self.text.replace_range(range, with);
+        // Removal: positions inside the removed part move to its start.
+        let removal = |p: usize| if p <= at { p } else if p < at + removed { at } else { p - removed };
+        for styled in &mut self.styles {
+            let (start, end) = (removal(styled.start), removal(styled.end));
+            // Insertion at `at`: a range starting there moves, one ending there does not grow.
+            styled.start = if start >= at { start + added } else { start };
+            styled.end = if end > at || (end == at && start >= at) { end + added } else { end };
+        }
+        self.styles.retain(|s| s.start < s.end);
+    }
+
+    /// Undoes the formatting just applied (the markers come back as plain text), if nothing
+    /// changed since. Returns whether it did.
+    pub fn undo_format(&mut self) -> bool {
+        let Some(undo) = self.undo.take() else { return false };
+        if undo.after != (self.text.clone(), self.cursor) {
+            return false;
+        }
+        (self.text, self.cursor, self.styles) = (undo.text, undo.cursor, undo.styles);
+        true
+    }
+
+    /// Applies the formatting whose closing marker was just typed, if any.
+    fn format(&mut self) {
+        let before = &self.text[..self.cursor];
+        for (marker, style) in MARKERS {
+            let Some(body) = before.strip_suffix(marker) else { continue };
+            // A single `*` right after another one is the end of a `**`.
+            if marker == "*" && body.ends_with('*') {
+                continue;
+            }
+            let Some(open) = body.rfind(marker) else { continue };
+            let content = &body[open + marker.len()..];
+            // The opening marker starts a word: not inside one (`a*b*`), nor part of `**`.
+            let starts_word = body[..open].chars().next_back().is_none_or(|c| !c.is_alphanumeric() && c != '*');
+            let valid = !content.is_empty()
+                && !content.contains('\n')
+                && !content.starts_with(char::is_whitespace)
+                && !content.ends_with(char::is_whitespace)
+                && !(marker == "*" && content.starts_with('*'))
+                && starts_word;
+            if !valid {
+                return;
+            }
+            let undo = (self.text.clone(), self.cursor, self.styles.clone());
+            let content_len = content.len();
+            self.splice(self.cursor - marker.len()..self.cursor, "");
+            self.splice(open..open + marker.len(), "");
+            self.styles.push(Styled { start: open, end: open + content_len, style });
+            self.cursor = open + content_len;
+            let after = (self.text.clone(), self.cursor);
+            self.undo = Some(Undo { text: undo.0, cursor: undo.1, styles: undo.2, after });
+            return;
+        }
     }
 
     /// Byte index of the cursor in [`Editor::text`].
@@ -25,7 +112,7 @@ impl Editor {
 
     /// Replaces the text from byte `start` up to the cursor by `with`.
     pub fn replace_to_cursor(&mut self, start: usize, with: &str) {
-        self.text.replace_range(start..self.cursor, with);
+        self.splice(start..self.cursor, with);
         self.cursor = start + with.len();
     }
 
@@ -44,11 +131,14 @@ impl Editor {
 
     pub fn insert(&mut self, s: &str) {
         let s = normalize_newlines(s);
-        self.text.insert_str(self.cursor, &s);
+        self.splice(self.cursor..self.cursor, &s);
         self.cursor += s.len();
         // Typing the closing colon of a known `:shortcode:` turns it into the emoji.
         if s == ":" {
             self.expand_shortcode();
+        }
+        if s == "*" || s == "~" {
+            self.format();
         }
     }
 
@@ -62,21 +152,21 @@ impl Editor {
             return;
         }
         if let Some(emoji) = emoji_expander::lookup(shortcode) {
-            self.text.replace_range(start..self.cursor, emoji);
+            self.splice(start..self.cursor, emoji);
             self.cursor = start + emoji.len();
         }
     }
 
     pub fn backspace(&mut self) {
         if let Some(prev) = self.prev_boundary() {
-            self.text.replace_range(prev..self.cursor, "");
+            self.splice(prev..self.cursor, "");
             self.cursor = prev;
         }
     }
 
     pub fn delete(&mut self) {
         if let Some(next) = self.next_boundary() {
-            self.text.replace_range(self.cursor..next, "");
+            self.splice(self.cursor..next, "");
         }
     }
 
@@ -174,6 +264,64 @@ fn normalize_newlines(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::Editor;
+    use crate::data::{Style, Styled};
+
+    fn typed(text: &str) -> Editor {
+        let mut e = Editor::default();
+        for c in text.chars() {
+            e.insert(c.encode_utf8(&mut [0; 4]));
+        }
+        e
+    }
+
+    fn styled(start: usize, end: usize, style: Style) -> Styled {
+        Styled { start, end, style }
+    }
+
+    #[test]
+    fn markers_format_when_closed() {
+        let e = typed("a **b** *c* ~d~ e");
+        assert_eq!(e.text(), "a b c d e");
+        assert_eq!(e.styles(), [styled(2, 3, Style::Bold), styled(4, 5, Style::Italic), styled(6, 7, Style::Strikethrough)]);
+    }
+
+    #[test]
+    fn esc_undoes_the_formatting_just_applied() {
+        let mut e = typed("Salut **tout**");
+        assert_eq!(e.text(), "Salut tout");
+        assert!(e.undo_format());
+        assert_eq!(e.text(), "Salut **tout**");
+        assert!(e.styles().is_empty());
+        assert!(!e.undo_format(), "once");
+
+        let mut e = typed("*a*");
+        e.insert(" ");
+        assert!(!e.undo_format(), "not after another change");
+        assert_eq!(e.text(), "a ");
+    }
+
+    #[test]
+    fn markers_need_words() {
+        for plain in ["2 * 3 * 4", "a*b*", "* x*", "** **", "~ ~", "*a\nb*"] {
+            assert_eq!(typed(plain).text(), plain);
+        }
+    }
+
+    #[test]
+    fn styles_follow_edits() {
+        let mut e = typed("**bold** x");
+        e.home();
+        e.insert(">> ");
+        assert_eq!(e.styles(), [styled(3, 7, Style::Bold)], "moved by text before");
+        e.right();
+        e.right();
+        e.insert("o");
+        assert_eq!(e.text(), ">> booold x".replacen("oo", "o", 1));
+        assert_eq!(e.styles(), [styled(3, 8, Style::Bold)], "grows with text inside");
+        e.end();
+        e.insert("!");
+        assert_eq!(e.styles(), [styled(3, 8, Style::Bold)], "not with text after");
+    }
 
     #[test]
     fn inserts_at_the_cursor() {

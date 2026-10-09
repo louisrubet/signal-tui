@@ -18,7 +18,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
-use crate::data::{self, Discussion, Message};
+use crate::data::{self, Discussion, Message, Styled};
 use crate::editor::Editor;
 use crate::settings::Settings;
 use crate::ui;
@@ -30,7 +30,7 @@ pub enum Action {
     /// Discussion opened: its messages are now read.
     Opened(usize),
     /// Send `text` in `discussion`, quoting message `reply_to` of that discussion.
-    Send { discussion: usize, text: String, reply_to: Option<usize> },
+    Send { discussion: usize, text: String, styles: Vec<Styled>, reply_to: Option<usize> },
     /// Send the text of message `msg` of discussion `from` to discussion `to`.
     Forward { from: usize, msg: usize, to: usize },
     /// [`App::settings`] changed: save them.
@@ -54,7 +54,8 @@ enum Screen {
         selected_msg: usize,
         scroll: usize,
         /// `Some` while the user is typing a new message.
-        composing: Option<Compose>,
+        /// Boxed: the draft (with its formatting undo) is much larger than the other states.
+        composing: Option<Box<Compose>>,
         /// `Some` while picking a reaction.
         reacting: Option<Picker>,
         /// Waiting for y/n to delete the selected message.
@@ -100,8 +101,8 @@ struct Completion {
 }
 
 impl Compose {
-    fn new(text: &str, reply_to: Option<usize>) -> Self {
-        Compose { editor: Editor::new(text), reply_to, completion: None }
+    fn new(text: &str, reply_to: Option<usize>) -> Box<Self> {
+        Box::new(Compose { editor: Editor::new(text), reply_to, completion: None })
     }
 
     /// The shortcode typed after the `:` of the completion, lowercased like the table.
@@ -404,19 +405,21 @@ impl App {
                     }
                     let editor = &mut compose.editor;
                     match key.code {
-                        KeyCode::Esc => *composing = None,
+                        // Esc first undoes the formatting just applied, then closes the draft.
+                        KeyCode::Esc => {
+                            if !editor.undo_format() {
+                                *composing = None
+                            }
+                        }
                         // Shift+Enter needs the kitty keyboard protocol; Alt+Enter works everywhere.
                         KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
                             editor.insert("\n")
                         }
                         KeyCode::Enter => {
-                            let text = editor.text().trim();
+                            let (text, styles) = data::trim_styled(editor.text(), editor.styles());
                             if !text.is_empty() {
-                                let action = Action::Send {
-                                    discussion: *discussion_idx,
-                                    text: text.to_string(),
-                                    reply_to: compose.reply_to,
-                                };
+                                let action =
+                                    Action::Send { discussion: *discussion_idx, text, styles, reply_to: compose.reply_to };
                                 *composing = None;
                                 return Some(action);
                             }
@@ -592,7 +595,7 @@ impl App {
                     &self.typing.iter().filter(|t| t.discussion == *discussion_idx).map(|t| t.name.as_str()).collect::<Vec<_>>(),
                     *selected_msg,
                     scroll,
-                    composing.as_ref(),
+                    composing.as_deref(),
                     reacting.as_ref(),
                     *deleting,
                     self.status.as_deref(),
@@ -661,14 +664,36 @@ fn copy_to_clipboard(out: &mut impl Write, text: &str) -> io::Result<()> {
 }
 
 fn print_row(out: &mut impl Write, y: u16, text: &str, selected: bool) -> io::Result<()> {
+    print_styled(out, y, text, &[], selected)
+}
+
+/// Prints `text` on row `y`, its `styles` as terminal attributes (bold, italic, crossed out).
+fn print_styled(out: &mut impl Write, y: u16, text: &str, styles: &[Styled], selected: bool) -> io::Result<()> {
     queue!(out, cursor::MoveTo(0, y))?;
-    if selected {
-        queue!(out, SetAttribute(Attribute::Reverse))?;
-    }
-    queue!(out, Print(text))?;
-    if selected {
+    let mut cuts: Vec<usize> = styles.iter().flat_map(|s| [s.start, s.end]).filter(|&at| at < text.len()).collect();
+    cuts.extend([0, text.len()]);
+    cuts.sort_unstable();
+    cuts.dedup();
+    for part in cuts.windows(2) {
+        let (start, end) = (part[0], part[1]);
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
         queue!(out, SetAttribute(Attribute::Reset))?;
+        if selected {
+            queue!(out, SetAttribute(Attribute::Reverse))?;
+        }
+        for styled in styles.iter().filter(|s| s.start <= start && end <= s.end) {
+            let attribute = match styled.style {
+                data::Style::Bold => Attribute::Bold,
+                data::Style::Italic => Attribute::Italic,
+                data::Style::Strikethrough => Attribute::CrossedOut,
+            };
+            queue!(out, SetAttribute(attribute))?;
+        }
+        queue!(out, Print(&text[start..end]))?;
     }
+    queue!(out, SetAttribute(Attribute::Reset))?;
     Ok(())
 }
 
@@ -902,7 +927,8 @@ fn draw_discussion(
     // Footer: the help/status line, or the compose area with one row per line of the draft
     // (at most half the screen, showing the end of the draft).
     let mut cursor_pos = None;
-    let footer: Vec<String> = match composing {
+    // Footer rows with their styles (only the draft has some).
+    let footer: Vec<(String, Vec<Styled>)> = match composing {
         Some(compose @ Compose { editor, reply_to, .. }) => {
             let prompt = match reply_to.and_then(|i| discussion.messages.get(i)) {
                 Some(m) if m.from_me => "Reply to yourself> ".to_string(),
@@ -912,7 +938,8 @@ fn draw_discussion(
             let indent = " ".repeat(ui::width_of(&prompt));
             let avail = width.saturating_sub(indent.len()).max(1);
             let max_rows = (height.saturating_sub(HEADER) / 2).max(1);
-            let draft: Vec<&str> = editor.text().split('\n').collect();
+            let text = editor.text();
+            let draft: Vec<&str> = text.split('\n').collect();
             let (cursor_line, _) = editor.cursor_line_col();
             // In screen columns: an emoji takes two.
             let cursor_col = ui::width_of(editor.line_before_cursor());
@@ -920,30 +947,35 @@ fn draw_discussion(
             let first = draft.len().saturating_sub(max_rows).min(cursor_line);
             // The cursor line scrolls sideways to keep the cursor visible.
             let offset = cursor_col.saturating_sub(avail - 1);
-            let rows: Vec<String> = draft[first..(first + max_rows).min(draft.len())]
+            let rows: Vec<(String, Vec<Styled>)> = draft[first..(first + max_rows).min(draft.len())]
                 .iter()
                 .enumerate()
                 .map(|(i, line)| {
                     let lead = if first + i == 0 { &prompt } else { &indent };
                     let skip = if first + i == cursor_line { offset } else { 0 };
-                    format!("{lead}{}", ui::columns(line, skip, avail))
+                    let shown = ui::columns(line, skip, avail);
+                    // Where `shown` is in the draft, for its styles.
+                    let at = shown.as_ptr() as usize - text.as_ptr() as usize;
+                    (format!("{lead}{shown}"), ui::styles_in(editor.styles(), at..at + shown.len(), lead.len()))
                 })
                 .collect();
             let col = indent.len() + cursor_col - offset;
             // The completion line goes above the draft.
             let completion = compose.completion_filter().map(|filter| {
-                completion_line(&filter, compose.completion.as_ref().map_or(0, |c| c.cursor), width)
+                (completion_line(&filter, compose.completion.as_ref().map_or(0, |c| c.cursor), width), Vec::new())
             });
             let above = usize::from(completion.is_some());
             cursor_pos = Some((col.min(width.saturating_sub(1)), cursor_line - first + above));
             completion.into_iter().chain(rows).collect()
         }
         None => match reacting {
-            Some(picker) => vec![picker_line(picker, width)],
-            None if deleting => vec!["Delete this message for everyone?   y yes   any other key: no".to_string()],
+            Some(picker) => vec![(picker_line(picker, width), Vec::new())],
+            None if deleting => {
+                vec![("Delete this message for everyone?   y yes   any other key: no".to_string(), Vec::new())]
+            }
             None => {
                 let help = "\u{2191}/\u{2193} navigate   r reply   e react   f forward   c copy   o open links   Del delete   Enter new message   Esc back   q quit";
-                vec![status.unwrap_or(help).to_string()]
+                vec![(status.unwrap_or(help).to_string(), Vec::new())]
             }
         },
     };
@@ -965,9 +997,9 @@ fn draw_discussion(
     // "Name ..." under the last message while someone types, kept in view with it.
     if !typing.is_empty() {
         if !lines.is_empty() {
-            lines.push(ui::RenderLine { msg_idx: None, kind: ui::LineKind::Left(String::new()) });
+            lines.push(ui::RenderLine::new(None, ui::LineKind::Left(String::new())));
         }
-        lines.push(ui::RenderLine { msg_idx: None, kind: ui::LineKind::Left(format!("{} ...", typing.join(", "))) });
+        lines.push(ui::RenderLine::new(None, ui::LineKind::Left(format!("{} ...", typing.join(", ")))));
         if selected_msg + 1 >= discussion.messages.len() {
             sel_max = lines.len() - 1;
         }
@@ -995,17 +1027,17 @@ fn draw_discussion(
         if idx < lines.len() {
             let rl = &lines[idx];
             visible_messages.extend(rl.msg_idx);
-            let text = ui::render_line_string(&rl.kind, width);
+            let (text, styles) = ui::render_line(rl, width);
             let selected = rl.msg_idx == Some(selected_msg);
-            print_row(out, y, &text, selected)?;
+            print_styled(out, y, &text, &styles, selected)?;
         } else {
             print_row(out, y, &" ".repeat(width), false)?;
         }
     }
 
     let footer_y = height.saturating_sub(footer.len());
-    for (row, text) in footer.iter().enumerate() {
-        print_row(out, (footer_y + row) as u16, &ui::pad_left(text, width), false)?;
+    for (row, (text, styles)) in footer.iter().enumerate() {
+        print_styled(out, (footer_y + row) as u16, &ui::pad_left(text, width), styles, false)?;
     }
     if let Some((col, row)) = cursor_pos {
         queue!(out, cursor::MoveTo(col as u16, (footer_y + row) as u16), cursor::Show)?;
@@ -1051,7 +1083,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         type_text(&mut app, " hello ");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "hello".to_string(), reply_to: None }));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "hello".to_string(), styles: vec![], reply_to: None }));
     }
 
     #[test]
@@ -1062,7 +1094,7 @@ mod tests {
         assert_eq!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)), None);
         type_text(&mut app, "b");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "a\nb".to_string(), reply_to: None }));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "a\nb".to_string(), styles: vec![], reply_to: None }));
     }
 
     #[test]
@@ -1077,7 +1109,7 @@ mod tests {
         app.handle_key(key(KeyCode::End));
         assert_eq!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), None);
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "bc".to_string(), reply_to: None }));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "bc".to_string(), styles: vec![], reply_to: None }));
     }
 
     #[test]
@@ -1092,7 +1124,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
         type_text(&mut app, "!");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "one! big two".to_string(), reply_to: None }));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "one! big two".to_string(), styles: vec![], reply_to: None }));
     }
 
     #[test]
@@ -1104,7 +1136,7 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Enter)), None, "Enter picks, does not send");
         type_text(&mut app, " now");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "go \u{1f680} now".to_string(), reply_to: None }));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "go \u{1f680} now".to_string(), styles: vec![], reply_to: None }));
     }
 
     #[test]
@@ -1115,7 +1147,7 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         assert!(!screen(&mut app).contains("[\u{1f680} rocket]"), "completion closed");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "a :ro".to_string(), reply_to: None }));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "a :ro".to_string(), styles: vec![], reply_to: None }));
     }
 
     #[test]
@@ -1144,12 +1176,54 @@ mod tests {
     }
 
     #[test]
+    fn markdown_formatting_is_sent_as_styles() {
+        let mut app = opened();
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, " **tout** *a* ~b~");
+        let send = app.handle_key(key(KeyCode::Enter));
+        let styles = vec![
+            Styled { start: 0, end: 4, style: data::Style::Bold },
+            Styled { start: 5, end: 6, style: data::Style::Italic },
+            Styled { start: 7, end: 8, style: data::Style::Strikethrough },
+        ];
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "tout a b".to_string(), styles, reply_to: None }));
+    }
+
+    #[test]
+    fn formatting_is_drawn_with_terminal_attributes() {
+        let bold = "\x1b[1m";
+        let mut app = opened();
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "**gras**");
+        let mut out = Vec::new();
+        app.draw(&mut out, 80, 30).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains(&format!("{bold}gras")), "in the draft");
+
+        let last = app.discussions[0].messages.len() - 1;
+        let message = &mut app.discussions[0].messages[last];
+        message.styles = vec![Styled { start: 0, end: 7, style: data::Style::Bold }];
+        let mut out = Vec::new();
+        app.draw(&mut out, 80, 30).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains(&format!("{bold}Morning")), "in a post");
+    }
+
+    #[test]
+    fn esc_undoes_formatting_then_closes() {
+        let mut app = opened();
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "**x**");
+        app.handle_key(key(KeyCode::Esc));
+        let send = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "**x**".to_string(), styles: vec![], reply_to: None }));
+    }
+
+    #[test]
     fn paste_keeps_line_breaks_without_sending() {
         let mut app = opened();
         app.handle_paste("line 1\nline 2");
         type_text(&mut app, "!");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "line 1\nline 2!".to_string(), reply_to: None }));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "line 1\nline 2!".to_string(), styles: vec![], reply_to: None }));
     }
 
     #[test]
@@ -1160,7 +1234,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('r')));
         type_text(&mut app, "ok");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "ok".to_string(), reply_to: Some(last - 1) }));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "ok".to_string(), styles: vec![], reply_to: Some(last - 1) }));
     }
 
     #[test]
@@ -1436,7 +1510,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('r')));
         type_text(&mut app, "x");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 1, text: "x".to_string(), reply_to: Some(1) }));
+        assert_eq!(send, Some(Action::Send { discussion: 1, text: "x".to_string(), styles: vec![], reply_to: Some(1) }));
     }
 
     #[test]
@@ -1447,6 +1521,6 @@ mod tests {
         type_text(&mut app, "x");
         let last = app.discussions[0].messages.len() - 1;
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "x".to_string(), reply_to: Some(last) }));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "x".to_string(), styles: vec![], reply_to: Some(last) }));
     }
 }
