@@ -39,6 +39,8 @@ pub enum Action {
     PinToggled(usize),
     /// Set our reaction `emoji` to message `msg` of `discussion`, or remove it.
     React { discussion: usize, msg: usize, emoji: String, remove: bool },
+    /// Delete our message `msg` of `discussion` for everyone (confirmed).
+    Delete { discussion: usize, msg: usize },
 }
 
 enum Screen {
@@ -55,6 +57,8 @@ enum Screen {
         composing: Option<Compose>,
         /// `Some` while picking a reaction.
         reacting: Option<Picker>,
+        /// Waiting for y/n to delete the selected message.
+        deleting: bool,
         /// Index and number of the messages that were new when it was opened.
         new_from: Option<(usize, usize)>,
     },
@@ -301,6 +305,7 @@ impl App {
                 scroll: 0,
                 composing: None,
                 reacting: None,
+                deleting: false,
                 new_from,
             };
             return Some(Action::Opened(selected));
@@ -331,8 +336,16 @@ impl App {
                 KeyCode::Char('q') | KeyCode::Esc => return Some(Action::Quit),
                 _ => {}
             },
-            Screen::Discussion { discussion_idx, selected_msg, composing, reacting, .. } => {
+            Screen::Discussion { discussion_idx, selected_msg, composing, reacting, deleting, .. } => {
                 let messages = &discussions[*discussion_idx].messages;
+                if *deleting {
+                    *deleting = false;
+                    if key.code == KeyCode::Char('y') {
+                        return Some(Action::Delete { discussion: *discussion_idx, msg: *selected_msg });
+                    }
+                    self.status = Some("Not deleted".to_string());
+                    return None;
+                }
                 if let Some(picker) = reacting {
                     // Browsing only goes through the matches of a typed shortcode.
                     let matches = if picker.filter.is_empty() { Vec::new() } else { reaction_matches(&picker.filter) };
@@ -451,7 +464,17 @@ impl App {
                         }
                         KeyCode::Char('q') => return Some(Action::Quit),
                         // Actions on the selected message (there is none in an empty discussion).
-                        KeyCode::Char('r' | 'f' | 'c' | 'o' | 'e') if messages.is_empty() => {}
+                        // Actions need a message, and there is nothing to act on in a deleted one.
+                        KeyCode::Char('r' | 'f' | 'c' | 'o' | 'e') | KeyCode::Delete
+                            if messages.get(*selected_msg).is_none_or(|m| m.deleted) => {}
+                        KeyCode::Delete => {
+                            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+                            if messages[*selected_msg].deletable(now_ms) {
+                                *deleting = true;
+                            } else {
+                                self.status = Some("Only your messages of the last 24 h can be deleted".to_string());
+                            }
+                        }
                         KeyCode::Char('e') => *reacting = Some(Picker::default()),
                         KeyCode::Char('r') => {
                             *composing = Some(Compose::new("", Some(*selected_msg)))
@@ -497,13 +520,13 @@ impl App {
                     let action = Action::Forward { from: *discussion_idx, msg: *msg_idx, to: *selected };
                     let (discussion_idx, selected_msg) = (*discussion_idx, *msg_idx);
                     self.screen =
-                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None, new_from: None };
+                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None, deleting: false, new_from: None };
                     return Some(action);
                 }
                 KeyCode::Esc => {
                     let (discussion_idx, selected_msg) = (*discussion_idx, *msg_idx);
                     self.screen =
-                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None, new_from: None };
+                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None, deleting: false, new_from: None };
                 }
                 _ => {}
             },
@@ -561,7 +584,7 @@ impl App {
                 w,
                 h,
             ),
-            Screen::Discussion { discussion_idx, selected_msg, scroll, composing, reacting, new_from } => {
+            Screen::Discussion { discussion_idx, selected_msg, scroll, composing, reacting, deleting, new_from } => {
                 let visible = draw_discussion(
                     out,
                     &self.discussions[*discussion_idx],
@@ -571,6 +594,7 @@ impl App {
                     scroll,
                     composing.as_ref(),
                     reacting.as_ref(),
+                    *deleting,
                     self.status.as_deref(),
                     w,
                     h,
@@ -866,6 +890,8 @@ fn draw_discussion(
     composing: Option<&Compose>,
     // The reaction picker, while picking.
     reacting: Option<&Picker>,
+    // Asking to confirm the deletion of the selected message.
+    deleting: bool,
     status: Option<&str>,
     w: u16,
     h: u16,
@@ -914,8 +940,9 @@ fn draw_discussion(
         }
         None => match reacting {
             Some(picker) => vec![picker_line(picker, width)],
+            None if deleting => vec!["Delete this message for everyone?   y yes   any other key: no".to_string()],
             None => {
-                let help = "\u{2191}/\u{2193} navigate   r reply   e react   f forward   c copy   o open links   Enter new message   Esc back   q quit";
+                let help = "\u{2191}/\u{2193} navigate   r reply   e react   f forward   c copy   o open links   Del delete   Enter new message   Esc back   q quit";
                 vec![status.unwrap_or(help).to_string()]
             }
         },
@@ -1324,6 +1351,29 @@ mod tests {
         let react = app.handle_key(key(KeyCode::Enter));
         let emoji = matches[matches.len() - 1].1.to_string();
         assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji, remove: false }));
+    }
+
+    #[test]
+    fn delete_own_recent_messages_after_confirmation() {
+        let mut app = opened();
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        app.push_message(0, Message::mine(now_ms, "oops".to_string(), None, false));
+        let last = app.discussions[0].messages.len() - 1;
+
+        app.handle_key(key(KeyCode::Delete));
+        assert!(screen(&mut app).contains("Delete this message for everyone?"));
+        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), None, "anything but y keeps it");
+        app.handle_key(key(KeyCode::Delete));
+        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), Some(Action::Delete { discussion: 0, msg: last }));
+
+        app.discussions[0].messages[last].mark_deleted();
+        assert!(screen(&mut app).contains("This message was deleted"));
+        assert_eq!(app.handle_key(key(KeyCode::Delete)), None, "already deleted");
+
+        // Old messages, and those of others, cannot be deleted.
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Delete));
+        assert!(screen(&mut app).contains("Only your messages of the last 24 h"));
     }
 
     #[test]

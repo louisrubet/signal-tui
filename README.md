@@ -27,6 +27,7 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 | `f` | forward the selected message |
 | `c` | copy the selected message (OSC 52) |
 | `o` | open the links of the selected message |
+| `Del` | delete your message for everyone (within 24 h) |
 | `P` | pin / unpin the selected chat |
 | `p` | parameters (from the chat list) |
 | `Esc` | back |

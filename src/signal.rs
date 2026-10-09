@@ -21,7 +21,7 @@ use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
-use presage::proto::data_message::{Quote, Reaction};
+use presage::proto::data_message::{Delete, Quote, Reaction};
 use presage::proto::typing_message::Action as TypingAction;
 use presage::proto::sync_message::{Content as SyncContent, Sent};
 use presage::proto::{DataMessage, GroupContextV2, SyncMessage};
@@ -359,6 +359,16 @@ impl Directory {
         })
     }
 
+    /// The deletion for everyone in `content`, if any: (id of the deleted message, ACI of
+    /// who deleted it). Received, or ours sent from another device.
+    pub fn deletion(&self, content: &Content) -> Option<(u64, String)> {
+        let (data, sent_elsewhere) = data_message(content)?;
+        let target = data.delete.as_ref()?.target_sent_timestamp?;
+        let sender = content.metadata.sender.raw_uuid();
+        let author = if sent_elsewhere { self.own_aci } else { sender };
+        Some((target, author.to_string()))
+    }
+
     /// The typing notification in `content`, if any (ours from other devices are ignored).
     pub fn typing(&self, content: &Content) -> Option<Typing> {
         let ContentBody::TypingMessage(typing) = &content.body else { return None };
@@ -397,6 +407,7 @@ impl Directory {
             reply_to: None,
             forwarded: false,
             reactions: Vec::new(),
+            deleted: false,
         };
         Some((message, data.quote.as_ref().and_then(|q| q.id)))
     }
@@ -576,6 +587,16 @@ pub async fn react(
         mine: true,
         emoji: (!remove).then(|| emoji.to_string()),
     })
+}
+
+/// Deletes our message `target` for everyone.
+pub async fn delete(manager: &mut SignalManager, thread: &Thread, target: &Message) -> Result<(), SignalError> {
+    let timestamp = Utc::now().timestamp_millis() as u64;
+    let message = DataMessage {
+        delete: Some(Delete { target_sent_timestamp: Some(target.id) }),
+        ..Default::default()
+    };
+    send_data_message(manager, thread, message, timestamp).await
 }
 
 /// Our ACI, as in [`Message::author`].
