@@ -101,7 +101,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 };
                 let Some(action) = action else { continue };
 
-                let (discussion, text, reply_to, forwarded) = match action {
+                let (discussion, text, styles, reply_to, forwarded) = match action {
                     Action::Quit => break,
                     Action::React { discussion, msg, emoji, remove } => {
                         let target = &app.discussions[discussion].messages[msg];
@@ -139,15 +139,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         }
                         continue;
                     }
-                    Action::Send { discussion, text, reply_to } => (discussion, text, reply_to, false),
-                    Action::Forward { from, msg, to } => (to, app.discussions[from].messages[msg].text.clone(), None, true),
+                    Action::Send { discussion, text, styles, reply_to } => (discussion, text, styles, reply_to, false),
+                    Action::Forward { from, msg, to } => {
+                        let message = &app.discussions[from].messages[msg];
+                        (to, message.text.clone(), message.styles.clone(), None, true)
+                    }
                 };
                 app.set_status("Sending\u{2026}");
                 app.draw(&mut out, w, h)?;
                 out.flush()?;
 
                 let quote = reply_to.map(|i| (i, &app.discussions[discussion].messages[i]));
-                match signal::send(&mut manager, &threads[discussion], &text, quote).await {
+                match signal::send(&mut manager, &threads[discussion], &text, &styles, quote).await {
                     Ok(mut message) => {
                         message.forwarded = forwarded;
                         app.push_message(discussion, message);

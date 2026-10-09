@@ -37,13 +37,17 @@ fn main() -> io::Result<()> {
                 app.discussions[discussion].messages[msg].set_reaction("me", true, emoji);
             }
             Some(Action::Opened(_) | Action::SettingsChanged | Action::PinToggled(_)) => {}
-            Some(Action::Send { discussion, text, reply_to }) => {
-                app.push_message(discussion, Message::mine(next_id, text, reply_to, false));
+            Some(Action::Send { discussion, text, styles, reply_to }) => {
+                let mut message = Message::mine(next_id, text, reply_to, false);
+                message.styles = styles;
+                app.push_message(discussion, message);
                 next_id += 1;
             }
             Some(Action::Forward { from, msg, to }) => {
-                let text = app.discussions[from].messages[msg].text.clone();
-                app.push_message(to, Message::mine(next_id, text, None, true));
+                let original = &app.discussions[from].messages[msg];
+                let mut message = Message::mine(next_id, original.text.clone(), None, true);
+                message.styles = original.styles.clone();
+                app.push_message(to, message);
                 next_id += 1;
                 app.set_status(format!("Forwarded to {}", app.discussions[to].title));
             }

@@ -16,10 +16,44 @@ pub struct Message {
     pub reactions: Vec<Reaction>,
     /// Deleted for everyone: shown as "This message was deleted".
     pub deleted: bool,
+    /// Formatting of `text`.
+    pub styles: Vec<Styled>,
 }
 
 /// How long after sending a message can be deleted for everyone (Signal's default limit).
 pub const DELETE_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Text formatting, as Signal sends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    Bold,
+    Italic,
+    Strikethrough,
+}
+
+/// `style` applied to the bytes `start..end` of a text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Styled {
+    pub start: usize,
+    pub end: usize,
+    pub style: Style,
+}
+
+/// `text` trimmed, with `styles` moved and cut to match.
+pub fn trim_styled(text: &str, styles: &[Styled]) -> (String, Vec<Styled>) {
+    let start = text.len() - text.trim_start().len();
+    let trimmed = text.trim();
+    let styles = styles
+        .iter()
+        .map(|s| Styled {
+            start: s.start.saturating_sub(start).min(trimmed.len()),
+            end: s.end.saturating_sub(start).min(trimmed.len()),
+            style: s.style,
+        })
+        .filter(|s| s.start < s.end)
+        .collect();
+    (trimmed.to_string(), styles)
+}
 
 /// An emoji reaction to a message.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +79,7 @@ impl Message {
             forwarded,
             reactions: Vec::new(),
             deleted: false,
+            styles: Vec::new(),
         }
     }
 
@@ -58,6 +93,7 @@ impl Message {
         self.deleted = true;
         self.text.clear();
         self.reactions.clear();
+        self.styles.clear();
     }
 
     /// Sets the reaction of `author` (replacing theirs), or removes it with `None`.
@@ -154,6 +190,7 @@ fn msg(from_me: bool, sender_name: &str, text: &str, ts: &str) -> Message {
         forwarded: false,
         reactions: Vec::new(),
         deleted: false,
+        styles: Vec::new(),
     }
 }
 

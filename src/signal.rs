@@ -24,14 +24,15 @@ use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretPar
 use presage::proto::data_message::{Delete, Quote, Reaction};
 use presage::proto::typing_message::Action as TypingAction;
 use presage::proto::sync_message::{Content as SyncContent, Sent};
-use presage::proto::{DataMessage, GroupContextV2, SyncMessage};
+use presage::proto::body_range::{AssociatedValue, Style as BodyStyle};
+use presage::proto::{BodyRange, DataMessage, GroupContextV2, SyncMessage};
 use presage::store::ContentsStore;
 pub use presage::store::Thread;
 use presage_store_sqlite::{SqliteStore, SqliteStoreError};
 use tokio::time::Instant;
 use url::Url;
 
-use crate::data::{Discussion, Message};
+use crate::data::{Discussion, Message, Style, Styled};
 
 pub type SignalError = presage::Error<SqliteStoreError>;
 pub type SignalManager = Manager<SqliteStore, Registered>;
@@ -397,6 +398,7 @@ impl Directory {
         let from_me = sent_elsewhere || sender == self.own_aci;
         let id = data.timestamp.unwrap_or_else(|| content.metadata.client_timestamp.timestamp_millis() as u64);
         let sender_name = self.name_of(&sender);
+        let styles = from_body_ranges(&text, &data.body_ranges);
         let message = Message {
             id,
             author: Some(if from_me { self.own_aci } else { sender }.to_string()),
@@ -408,6 +410,7 @@ impl Directory {
             forwarded: false,
             reactions: Vec::new(),
             deleted: false,
+            styles,
         };
         Some((message, data.quote.as_ref().and_then(|q| q.id)))
     }
@@ -537,16 +540,71 @@ pub async fn load_discussions(
     Ok((threads, discussions))
 }
 
-/// Sends `text` to `thread`, quoting `quote` if given. Returns the sent message.
+/// Byte offset in `text` of the UTF-16 offset `utf16` (Signal counts in UTF-16 units).
+fn byte_offset(text: &str, utf16: usize) -> usize {
+    let mut units = 0;
+    for (i, c) in text.char_indices() {
+        if units >= utf16 {
+            return i;
+        }
+        units += c.len_utf16();
+    }
+    text.len()
+}
+
+/// The styles of a received text, from its Signal body ranges (mentions and other styles
+/// are left out).
+fn from_body_ranges(text: &str, ranges: &[BodyRange]) -> Vec<Styled> {
+    ranges
+        .iter()
+        .filter_map(|range| {
+            let Some(AssociatedValue::Style(style)) = range.associated_value else { return None };
+            let style = match BodyStyle::try_from(style).ok()? {
+                BodyStyle::Bold => Style::Bold,
+                BodyStyle::Italic => Style::Italic,
+                BodyStyle::Strikethrough => Style::Strikethrough,
+                _ => return None,
+            };
+            let start = range.start? as usize;
+            let (start, end) = (byte_offset(text, start), byte_offset(text, start + range.length? as usize));
+            (start < end).then_some(Styled { start, end, style })
+        })
+        .collect()
+}
+
+/// Signal body ranges for `styles` of `text`.
+fn to_body_ranges(text: &str, styles: &[Styled]) -> Vec<BodyRange> {
+    let utf16 = |byte: usize| text[..byte].encode_utf16().count() as u32;
+    styles
+        .iter()
+        .map(|styled| {
+            let style = match styled.style {
+                Style::Bold => BodyStyle::Bold,
+                Style::Italic => BodyStyle::Italic,
+                Style::Strikethrough => BodyStyle::Strikethrough,
+            };
+            BodyRange {
+                start: Some(utf16(styled.start)),
+                length: Some(utf16(styled.end) - utf16(styled.start)),
+                associated_value: Some(AssociatedValue::Style(style as i32)),
+            }
+        })
+        .collect()
+}
+
+/// Sends `text` with its `styles` to `thread`, quoting `quote` if given. Returns the sent
+/// message.
 pub async fn send(
     manager: &mut SignalManager,
     thread: &Thread,
     text: &str,
+    styles: &[Styled],
     quote: Option<(usize, &Message)>,
 ) -> Result<Message, SignalError> {
     let timestamp = Utc::now().timestamp_millis() as u64;
     let message = DataMessage {
         body: Some(text.to_string()),
+        body_ranges: to_body_ranges(text, styles),
         quote: quote.map(|(_, q)| Quote {
             id: Some(q.id),
             author_aci: q.author.clone(),
@@ -558,6 +616,7 @@ pub async fn send(
     send_data_message(manager, thread, message, timestamp).await?;
     let mut sent = Message::mine(timestamp, text.to_string(), quote.map(|(i, _)| i), false);
     sent.author = Some(own_aci(manager));
+    sent.styles = styles.to_vec();
     Ok(sent)
 }
 
@@ -623,5 +682,20 @@ async fn send_data_message(
             });
             manager.send_message_to_group(master_key, message, timestamp).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_ranges_count_utf16_units() {
+        // "é" is one UTF-16 unit but two bytes, "🚀" two units and four bytes.
+        let text = "é🚀 bold end";
+        let styles = vec![Styled { start: 7, end: 11, style: Style::Bold }];
+        let ranges = to_body_ranges(text, &styles);
+        assert_eq!((ranges[0].start, ranges[0].length), (Some(4), Some(4)));
+        assert_eq!(from_body_ranges(text, &ranges), styles);
     }
 }
