@@ -46,7 +46,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         eprintln!("Store {db} deleted. Also remove the old \"{DEVICE_NAME}\" device from the phone (Settings > Linked devices).");
     }
 
-    let store = signal::open_store(db, None).await?;
+    let store = signal_tui::store_key::open_encrypted(db).await?;
     let (mut manager, linked) = signal::link_or_load(store, DEVICE_NAME, |url| {
         println!("Scan this QR code from Signal on your phone (Settings > Linked devices):");
         qr::print_qr(url.as_str());
