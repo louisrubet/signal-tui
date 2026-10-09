@@ -37,6 +37,8 @@ pub enum Action {
     SettingsChanged,
     /// The discussion was pinned or unpinned ([`Discussion::pinned`]): save it.
     PinToggled(usize),
+    /// Set our reaction `emoji` to message `msg` of `discussion`, or remove it.
+    React { discussion: usize, msg: usize, emoji: String, remove: bool },
 }
 
 enum Screen {
@@ -51,6 +53,8 @@ enum Screen {
         scroll: usize,
         /// `Some` while the user is typing a new message.
         composing: Option<Compose>,
+        /// `Some` while picking a reaction: the shortcode typed so far.
+        reacting: Option<String>,
     },
     /// Picking the discussion to forward a message to.
     Forward {
@@ -83,6 +87,22 @@ impl Compose {
     fn new(text: &str, reply_to: Option<usize>) -> Self {
         Compose { editor: Editor::new(text), reply_to }
     }
+}
+
+/// The reactions Signal offers first, picked with 1 to 6.
+const QUICK_REACTIONS: [&str; 6] =
+    ["\u{2764}\u{fe0f}", "\u{1f44d}", "\u{1f44e}", "\u{1f602}", "\u{1f62e}", "\u{1f622}"];
+
+/// Emoji whose shortcode starts with `filter` (an exact shortcode first), one per emoji.
+fn reaction_matches(filter: &str) -> Vec<(&'static str, &'static str)> {
+    let exact = emoji_expander::EMOJIS.get_key_value(filter).map(|(k, v)| (*k, *v));
+    let mut matches: Vec<(&str, &str)> = Vec::new();
+    for (shortcode, emoji) in exact.into_iter().chain(emoji_expander::search(filter)) {
+        if !matches.iter().any(|(_, e)| *e == emoji) {
+            matches.push((shortcode, emoji));
+        }
+    }
+    matches
 }
 
 /// Without news, someone is no longer shown typing after this (as Signal clients do).
@@ -196,7 +216,13 @@ impl App {
         {
             let last_msg = self.discussions[selected].messages.len().saturating_sub(1);
             self.discussions[selected].unread = false;
-            self.screen = Screen::Discussion { discussion_idx: selected, selected_msg: last_msg, scroll: 0, composing: None };
+            self.screen = Screen::Discussion {
+                discussion_idx: selected,
+                selected_msg: last_msg,
+                scroll: 0,
+                composing: None,
+                reacting: None,
+            };
             return Some(Action::Opened(selected));
         }
         let discussions = &self.discussions;
@@ -225,8 +251,39 @@ impl App {
                 KeyCode::Char('q') | KeyCode::Esc => return Some(Action::Quit),
                 _ => {}
             },
-            Screen::Discussion { discussion_idx, selected_msg, composing, .. } => {
+            Screen::Discussion { discussion_idx, selected_msg, composing, reacting, .. } => {
                 let messages = &discussions[*discussion_idx].messages;
+                if let Some(filter) = reacting {
+                    let pick = match key.code {
+                        KeyCode::Esc => {
+                            *reacting = None;
+                            None
+                        }
+                        KeyCode::Char(c @ '1'..='6') if filter.is_empty() => {
+                            Some(QUICK_REACTIONS[c as usize - '1' as usize])
+                        }
+                        KeyCode::Char(c) if c.is_alphanumeric() || "_+-".contains(c) => {
+                            filter.extend(c.to_lowercase());
+                            None
+                        }
+                        KeyCode::Backspace => {
+                            filter.pop();
+                            None
+                        }
+                        KeyCode::Enter => reaction_matches(filter).first().map(|(_, emoji)| *emoji),
+                        _ => None,
+                    };
+                    let emoji = pick?;
+                    // Picking our current reaction again removes it.
+                    let remove = messages[*selected_msg].my_reaction() == Some(emoji);
+                    *reacting = None;
+                    return Some(Action::React {
+                        discussion: *discussion_idx,
+                        msg: *selected_msg,
+                        emoji: emoji.to_string(),
+                        remove,
+                    });
+                }
                 if let Some(compose) = composing {
                     let editor = &mut compose.editor;
                     match key.code {
@@ -280,7 +337,8 @@ impl App {
                         }
                         KeyCode::Char('q') => return Some(Action::Quit),
                         // Actions on the selected message (there is none in an empty discussion).
-                        KeyCode::Char('r' | 'f' | 'c' | 'o') if messages.is_empty() => {}
+                        KeyCode::Char('r' | 'f' | 'c' | 'o' | 'e') if messages.is_empty() => {}
+                        KeyCode::Char('e') => *reacting = Some(String::new()),
                         KeyCode::Char('r') => {
                             *composing = Some(Compose::new("", Some(*selected_msg)))
                         }
@@ -324,12 +382,14 @@ impl App {
                 KeyCode::Enter => {
                     let action = Action::Forward { from: *discussion_idx, msg: *msg_idx, to: *selected };
                     let (discussion_idx, selected_msg) = (*discussion_idx, *msg_idx);
-                    self.screen = Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None };
+                    self.screen =
+                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None };
                     return Some(action);
                 }
                 KeyCode::Esc => {
                     let (discussion_idx, selected_msg) = (*discussion_idx, *msg_idx);
-                    self.screen = Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None };
+                    self.screen =
+                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None };
                 }
                 _ => {}
             },
@@ -384,7 +444,7 @@ impl App {
                 w,
                 h,
             ),
-            Screen::Discussion { discussion_idx, selected_msg, scroll, composing } => {
+            Screen::Discussion { discussion_idx, selected_msg, scroll, composing, reacting } => {
                 let visible = draw_discussion(
                     out,
                     &self.discussions[*discussion_idx],
@@ -392,6 +452,7 @@ impl App {
                     *selected_msg,
                     scroll,
                     composing.as_ref(),
+                    reacting.as_deref(),
                     self.status.as_deref(),
                     w,
                     h,
@@ -564,7 +625,7 @@ fn draw_list(
                 let discussion = &discussions[idx];
                 let title =
                     if typing.contains(&idx) { format!("{} ...", discussion.title) } else { discussion.title.clone() };
-                // The star takes two columns but counts as one character: pad one less.
+                // "⭐ " and the blank prefix both take three columns.
                 let text = if discussion.unread {
                     format!("\u{2b50} {}", ui::pad_left(&title, width.saturating_sub(3)))
                 } else {
@@ -612,6 +673,8 @@ fn draw_discussion(
     selected_msg: usize,
     scroll: &mut usize,
     composing: Option<&Compose>,
+    // The shortcode typed so far while picking a reaction.
+    reacting: Option<&str>,
     status: Option<&str>,
     w: u16,
     h: u16,
@@ -651,10 +714,23 @@ fn draw_discussion(
             cursor_pos = Some((col.min(width.saturating_sub(1)), cursor_line - first));
             rows
         }
-        None => {
-            let help = "\u{2191}/\u{2193} navigate   r reply   f forward   c copy   o open links   Enter new message   Esc back   q quit";
-            vec![status.unwrap_or(help).to_string()]
-        }
+        None => match reacting {
+            Some("") => {
+                let quick: Vec<String> =
+                    QUICK_REACTIONS.iter().enumerate().map(|(i, emoji)| format!("{} {emoji}", i + 1)).collect();
+                vec![format!("React: {}   or type a shortcode   Esc cancel", quick.join("  "))]
+            }
+            Some(filter) => {
+                let matches: Vec<String> =
+                    reaction_matches(filter).iter().take(8).map(|(short, emoji)| format!("{emoji} {short}")).collect();
+                let matches = if matches.is_empty() { "no match".to_string() } else { matches.join("  ") };
+                vec![format!("React :{filter}  \u{2192} {matches}   Enter first")]
+            }
+            None => {
+                let help = "\u{2191}/\u{2193} navigate   r reply   e react   f forward   c copy   o open links   Enter new message   Esc back   q quit";
+                vec![status.unwrap_or(help).to_string()]
+            }
+        },
     };
     let viewport = height.saturating_sub(HEADER + footer.len()).max(1);
 
@@ -946,6 +1022,42 @@ mod tests {
         let Some(Action::Send { reply_to: Some(selected), .. }) = send else { panic!("{send:?}") };
         assert_eq!(selected, 39 - app.message_page);
         assert!(app.message_page >= 5, "about a screen of messages, got {}", app.message_page);
+    }
+
+    #[test]
+    fn react_with_a_quick_pick_or_a_shortcode() {
+        let mut app = opened();
+        let last = app.discussions[0].messages.len() - 1;
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(screen(&mut app).contains("React:"));
+        let react = app.handle_key(key(KeyCode::Char('2')));
+        let thumbs_up = "\u{1f44d}".to_string();
+        assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji: thumbs_up.clone(), remove: false }));
+
+        app.handle_key(key(KeyCode::Char('e')));
+        type_text(&mut app, "rocket");
+        assert!(screen(&mut app).contains("\u{1f680} rocket"));
+        let react = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji: "\u{1f680}".to_string(), remove: false }));
+
+        // Our own reaction picked again: removed.
+        app.discussions[0].messages[last].set_reaction("me", true, Some(&thumbs_up));
+        app.handle_key(key(KeyCode::Char('e')));
+        let react = app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji: thumbs_up, remove: true }));
+    }
+
+    #[test]
+    fn reactions_are_shown_under_the_message() {
+        let mut app = opened();
+        let last = app.discussions[0].messages.len() - 1;
+        let message = &mut app.discussions[0].messages[last];
+        message.set_reaction("a", false, Some("\u{1f44d}"));
+        message.set_reaction("b", false, Some("\u{1f44d}"));
+        message.set_reaction("c", true, Some("\u{2764}\u{fe0f}"));
+        assert!(screen(&mut app).contains("\u{1f44d} 2  \u{2764}\u{fe0f}"));
+        app.discussions[0].messages[last].set_reaction("c", true, None);
+        assert!(!screen(&mut app).contains("\u{2764}\u{fe0f}"));
     }
 
     #[test]

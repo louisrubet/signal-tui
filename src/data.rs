@@ -12,6 +12,18 @@ pub struct Message {
     /// Index, in the same discussion, of the message this one replies to.
     pub reply_to: Option<usize>,
     pub forwarded: bool,
+    /// Emoji reactions, one per author.
+    pub reactions: Vec<Reaction>,
+}
+
+/// An emoji reaction to a message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reaction {
+    /// ACI of who reacted.
+    pub author: String,
+    pub emoji: String,
+    /// Our own reaction (from this device or another).
+    pub mine: bool,
 }
 
 impl Message {
@@ -26,7 +38,37 @@ impl Message {
             timestamp: chrono::Local::now().naive_local(),
             reply_to,
             forwarded,
+            reactions: Vec::new(),
         }
+    }
+
+    /// Sets the reaction of `author` (replacing theirs), or removes it with `None`.
+    pub fn set_reaction(&mut self, author: &str, mine: bool, emoji: Option<&str>) {
+        self.reactions.retain(|r| r.author != author);
+        if let Some(emoji) = emoji {
+            self.reactions.push(Reaction { author: author.to_string(), emoji: emoji.to_string(), mine });
+        }
+    }
+
+    /// Our own reaction, if any.
+    pub fn my_reaction(&self) -> Option<&str> {
+        self.reactions.iter().find(|r| r.mine).map(|r| r.emoji.as_str())
+    }
+
+    /// The reactions grouped by emoji, in order of appearance: `❤️ 2  👍` (count when > 1).
+    pub fn reaction_summary(&self) -> String {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for reaction in &self.reactions {
+            match counts.iter_mut().find(|(emoji, _)| *emoji == reaction.emoji) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((&reaction.emoji, 1)),
+            }
+        }
+        let parts: Vec<String> = counts
+            .into_iter()
+            .map(|(emoji, count)| if count > 1 { format!("{emoji} {count}") } else { emoji.to_string() })
+            .collect();
+        parts.join("  ")
     }
 }
 
@@ -75,6 +117,7 @@ fn msg(from_me: bool, sender_name: &str, text: &str, ts: &str) -> Message {
         timestamp,
         reply_to: None,
         forwarded: false,
+        reactions: Vec::new(),
     }
 }
 
@@ -121,7 +164,21 @@ pub fn mock_discussions() -> Vec<Discussion> {
                     "2026-07-17 10:30",
                 ),
                 Message { reply_to: Some(3), ..msg(true, "", "Thanks, having a look.", "2026-07-17 10:35") },
-            ],
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut m)| {
+                // A few reactions for the demo.
+                if i == 3 {
+                    m.set_reaction("me", true, Some("\u{1f44d}"));
+                    m.set_reaction("bob", false, Some("\u{1f44d}"));
+                }
+                if i == 4 {
+                    m.set_reaction("bob", false, Some("\u{2764}\u{fe0f}"));
+                }
+                m
+            })
+            .collect(),
         },
         Discussion {
             title: "Chloe Renard".to_string(),

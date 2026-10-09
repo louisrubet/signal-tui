@@ -30,6 +30,10 @@ fn main() -> io::Result<()> {
         };
         match action {
             Some(Action::Quit) => return Ok(()),
+            Some(Action::React { discussion, msg, emoji, remove }) => {
+                let emoji = (!remove).then_some(emoji.as_str());
+                app.discussions[discussion].messages[msg].set_reaction("me", true, emoji);
+            }
             Some(Action::Opened(_) | Action::SettingsChanged | Action::PinToggled(_)) => {}
             Some(Action::Send { discussion, text, reply_to }) => {
                 app.push_message(discussion, Message::mine(next_id, text, reply_to, false));

@@ -21,7 +21,7 @@ use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
-use presage::proto::data_message::Quote;
+use presage::proto::data_message::{Quote, Reaction};
 use presage::proto::typing_message::Action as TypingAction;
 use presage::proto::sync_message::{Content as SyncContent, Sent};
 use presage::proto::{DataMessage, GroupContextV2, SyncMessage};
@@ -288,6 +288,26 @@ pub struct Typing {
     pub started: bool,
 }
 
+/// Someone set or removed their reaction to a message.
+pub struct ReactionUpdate {
+    /// Id of the message reacted to ([`Message::id`]).
+    pub target_id: u64,
+    /// ACI of who reacted.
+    pub author: String,
+    pub mine: bool,
+    /// `None` when the reaction is removed.
+    pub emoji: Option<String>,
+}
+
+impl ReactionUpdate {
+    /// Applies it to the message of `discussion` it targets, if that message is there.
+    pub fn apply(&self, discussion: &mut Discussion) -> bool {
+        let Some(idx) = discussion.position_of(self.target_id) else { return false };
+        discussion.messages[idx].set_reaction(&self.author, self.mine, self.emoji.as_deref());
+        true
+    }
+}
+
 /// Turns stored or received Signal messages into interface [`Message`]s.
 pub struct Directory {
     own_aci: Uuid,
@@ -322,6 +342,21 @@ impl Directory {
             Some(name) => name.clone(),
             None => aci.to_string()[..8].to_string(),
         }
+    }
+
+    /// The reaction in `content`, if any (received, or ours sent from another device).
+    pub fn reaction(&self, content: &Content) -> Option<ReactionUpdate> {
+        let (data, sent_elsewhere) = data_message(content)?;
+        let reaction = data.reaction.as_ref()?;
+        let sender = content.metadata.sender.raw_uuid();
+        let mine = sent_elsewhere || sender == self.own_aci;
+        let author = if mine { self.own_aci } else { sender };
+        Some(ReactionUpdate {
+            target_id: reaction.target_sent_timestamp?,
+            author: author.to_string(),
+            mine,
+            emoji: if reaction.remove() { None } else { reaction.emoji.clone() },
+        })
     }
 
     /// The typing notification in `content`, if any (ours from other devices are ignored).
@@ -361,6 +396,7 @@ impl Directory {
             timestamp: content.metadata.client_timestamp.with_timezone(&Local).naive_local(),
             reply_to: None,
             forwarded: false,
+            reactions: Vec::new(),
         };
         Some((message, data.quote.as_ref().and_then(|q| q.id)))
     }
@@ -475,7 +511,14 @@ pub async fn load_discussions(
         let mut contents: Vec<Content> = manager.store().messages(&conversation.thread, ..).await?.flatten().collect();
         contents.sort_by_key(|c| c.metadata.client_timestamp);
         for content in &contents {
-            directory.append(&mut discussion, content);
+            match directory.reaction(content) {
+                Some(reaction) => {
+                    reaction.apply(&mut discussion);
+                }
+                None => {
+                    directory.append(&mut discussion, content);
+                }
+            }
         }
         threads.push(conversation.thread.clone());
         discussions.push(discussion);
@@ -491,9 +534,8 @@ pub async fn send(
     quote: Option<(usize, &Message)>,
 ) -> Result<Message, SignalError> {
     let timestamp = Utc::now().timestamp_millis() as u64;
-    let mut message = DataMessage {
+    let message = DataMessage {
         body: Some(text.to_string()),
-        timestamp: Some(timestamp),
         quote: quote.map(|(_, q)| Quote {
             id: Some(q.id),
             author_aci: q.author.clone(),
@@ -502,8 +544,55 @@ pub async fn send(
         }),
         ..Default::default()
     };
+    send_data_message(manager, thread, message, timestamp).await?;
+    let mut sent = Message::mine(timestamp, text.to_string(), quote.map(|(i, _)| i), false);
+    sent.author = Some(own_aci(manager));
+    Ok(sent)
+}
+
+/// Sets our reaction `emoji` to `target`, or removes it. Returns the update to apply.
+pub async fn react(
+    manager: &mut SignalManager,
+    thread: &Thread,
+    target: &Message,
+    emoji: &str,
+    remove: bool,
+) -> Result<ReactionUpdate, SignalError> {
+    let timestamp = Utc::now().timestamp_millis() as u64;
+    let message = DataMessage {
+        reaction: Some(Reaction {
+            emoji: Some(emoji.to_string()),
+            remove: Some(remove),
+            target_author_aci: target.author.clone(),
+            target_sent_timestamp: Some(target.id),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    send_data_message(manager, thread, message, timestamp).await?;
+    Ok(ReactionUpdate {
+        target_id: target.id,
+        author: own_aci(manager),
+        mine: true,
+        emoji: (!remove).then(|| emoji.to_string()),
+    })
+}
+
+/// Our ACI, as in [`Message::author`].
+fn own_aci(manager: &SignalManager) -> String {
+    manager.registration_data().service_ids.aci.to_string()
+}
+
+/// Sends `message` to `thread` (with the group context for a group).
+async fn send_data_message(
+    manager: &mut SignalManager,
+    thread: &Thread,
+    mut message: DataMessage,
+    timestamp: u64,
+) -> Result<(), SignalError> {
+    message.timestamp = Some(timestamp);
     match thread {
-        Thread::Contact(recipient) => manager.send_message(*recipient, message, timestamp).await?,
+        Thread::Contact(recipient) => manager.send_message(*recipient, message, timestamp).await,
         Thread::Group(master_key) => {
             let revision = manager.store().group(*master_key).await?.map_or(0, |g| g.revision);
             message.group_v2 = Some(GroupContextV2 {
@@ -511,10 +600,7 @@ pub async fn send(
                 revision: Some(revision),
                 ..Default::default()
             });
-            manager.send_message_to_group(master_key, message, timestamp).await?
+            manager.send_message_to_group(master_key, message, timestamp).await
         }
     }
-    let mut sent = Message::mine(timestamp, text.to_string(), quote.map(|(i, _)| i), false);
-    sent.author = Some(manager.registration_data().service_ids.aci.to_string());
-    Ok(sent)
 }
