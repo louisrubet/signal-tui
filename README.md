@@ -36,7 +36,7 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 ## Good to know
 
 - **No history.** Signal doesn't send past messages to linked devices. You only see messages received since linking.
-- **⭐** marks chats with messages received since you last opened them.
+- **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.
 - **Store**: `~/.local/share/signal-tui/` (holds the device keys). Override with `SIGNAL_TUI_DB`.
 - **presage fork**: [louisrubet/presage](https://github.com/louisrubet/presage/tree/storage-groups) adds group sync from the Storage Service.
 

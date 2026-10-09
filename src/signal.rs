@@ -438,10 +438,10 @@ impl ReadMarks {
         ReadMarks { path, marks }
     }
 
-    /// Whether `discussion` has messages received after it was last read.
-    pub fn is_unread(&self, thread: &Thread, discussion: &Discussion) -> bool {
+    /// Number of messages of `discussion` received after it was last read.
+    pub fn unread_count(&self, thread: &Thread, discussion: &Discussion) -> usize {
         let last_read = self.marks.get(&thread_key(thread)).copied().unwrap_or(0);
-        discussion.messages.iter().any(|m| !m.from_me && m.id > last_read)
+        discussion.messages.iter().filter(|m| !m.from_me && m.id > last_read).count()
     }
 
     /// Records that every message of `discussion` is read, and saves.

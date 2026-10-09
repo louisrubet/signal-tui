@@ -75,16 +75,33 @@ impl Message {
 pub struct Discussion {
     pub title: String,
     pub messages: Vec<Message>,
-    /// Has messages received since it was last opened.
-    pub unread: bool,
+    /// Number of messages received since it was last opened.
+    pub unread: usize,
     /// Rank in the "Pinned" list (pin order: a chat pinned later comes after); `None` when
     /// not pinned.
     pub pinned: Option<u32>,
 }
 
 impl Discussion {
+    /// Index of the oldest unread message: the `unread`-th received one from the end.
+    pub fn first_unread(&self) -> Option<usize> {
+        if self.unread == 0 {
+            return None;
+        }
+        let mut left = self.unread;
+        for (i, m) in self.messages.iter().enumerate().rev() {
+            if !m.from_me {
+                left -= 1;
+                if left == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
     pub fn new(title: String) -> Self {
-        Discussion { title, messages: Vec::new(), unread: false, pinned: None }
+        Discussion { title, messages: Vec::new(), unread: 0, pinned: None }
     }
 
     /// Index of the message with this Signal id.
@@ -125,7 +142,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
     vec![
         Discussion {
             title: "Alice Martin".to_string(),
-            unread: false,
+            unread: 0,
             pinned: Some(0),
             messages: vec![
                 msg(false, "Alice Martin", "Hey! Are we still on for tomorrow?", "2026-07-15 09:12"),
@@ -140,7 +157,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
         },
         Discussion {
             title: "Family Group".to_string(),
-            unread: true,
+            unread: 2,
             pinned: None,
             messages: vec![
                 msg(false, "Mom", "Don't forget dinner on Sunday.", "2026-07-13 12:00"),
@@ -151,7 +168,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
         },
         Discussion {
             title: "Bob Dupont".to_string(),
-            unread: false,
+            unread: 0,
             pinned: None,
             messages: vec![
                 msg(false, "Bob Dupont", "Did you push the fix?", "2026-07-17 10:00"),
@@ -182,7 +199,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
         },
         Discussion {
             title: "Chloe Renard".to_string(),
-            unread: false,
+            unread: 0,
             pinned: None,
             messages: vec![
                 msg(false, "Chloe Renard", "Happy birthday!! 🎉", "2026-06-01 07:30"),

@@ -121,7 +121,8 @@ fn wrap_line(text: &str, width: usize) -> Vec<String> {
 
 /// Builds the flat list of screen lines for a discussion: date separators,
 /// sender name / message text / time lines, and blank spacers between messages.
-pub fn build_discussion_lines(discussion: &Discussion, width: usize) -> Vec<RenderLine> {
+/// `new_from` (index, count) puts a "N new messages" line above the first new message.
+pub fn build_discussion_lines(discussion: &Discussion, width: usize, new_from: Option<(usize, usize)>) -> Vec<RenderLine> {
     let mut out = Vec::new();
     let mut last_date: Option<chrono::NaiveDate> = None;
 
@@ -133,6 +134,15 @@ pub fn build_discussion_lines(discussion: &Discussion, width: usize) -> Vec<Rend
                 kind: LineKind::Center(date.format("%A, %B %-d, %Y").to_string()),
             });
             last_date = Some(date);
+        }
+        if let Some((first, count)) = new_from
+            && idx == first
+        {
+            let label = if count == 1 { "1 new message".to_string() } else { format!("{count} new messages") };
+            out.push(RenderLine {
+                msg_idx: None,
+                kind: LineKind::Center(format!("\u{2500}\u{2500}\u{2500} {label} \u{2500}\u{2500}\u{2500}")),
+            });
         }
 
         let time_str = m.timestamp.format("%H:%M").to_string();
