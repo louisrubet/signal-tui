@@ -31,7 +31,7 @@ async fn main() {
         }
     }
 
-    let store = signal::open_store(db, None).await.unwrap();
+    let store = signal_tui::store_key::open_encrypted(db).await.unwrap();
     let (mut manager, _) = signal::link_or_load(store, "signal-tui", |url| {
         println!("Scan this QR code from Signal on your phone (Settings > Linked devices):");
         qr::print_qr(url.as_str());
