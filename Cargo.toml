@@ -16,8 +16,8 @@ base64 = "0.22"
 open = "5.3"
 notify-rust = "4.18"
 unicode-width = "0.2"
-# :shortcode: to emoji table (library added on the lib branch).
-emoji-expander = { git = "https://github.com/louisrubet/emoji-expander", rev = "fcf15f58da57bb716a6361a8561f2c10f4ca0a1d" }
+# :shortcode: to emoji table (tip of main).
+emoji-expander = { git = "https://github.com/louisrubet/emoji-expander", rev = "ff3c299d96433fccb7140ea7e908063f9ed7096d" }
 qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]

@@ -934,7 +934,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 [[package]]
 name = "emoji-expander"
 version = "0.1.0"
-source = "git+https://github.com/louisrubet/emoji-expander?rev=fcf15f58da57bb716a6361a8561f2c10f4ca0a1d#fcf15f58da57bb716a6361a8561f2c10f4ca0a1d"
+source = "git+https://github.com/louisrubet/emoji-expander?rev=ff3c299d96433fccb7140ea7e908063f9ed7096d#ff3c299d96433fccb7140ea7e908063f9ed7096d"
 dependencies = [
  "lazy_static",
 ]
