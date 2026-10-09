@@ -1,4 +1,24 @@
+use unicode_width::UnicodeWidthStr;
+
 use crate::data::Discussion;
+
+/// Columns `s` takes on screen (an emoji takes two).
+pub fn width_of(s: &str) -> usize {
+    s.width()
+}
+
+/// Longest prefix of `s` that fits in `width` columns.
+fn fit(s: &str, width: usize) -> &str {
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        let next = i + c.len_utf8();
+        if width_of(&s[..next]) > width {
+            break;
+        }
+        end = next;
+    }
+    &s[..end]
+}
 
 #[derive(Debug)]
 pub enum LineKind {
@@ -14,34 +34,30 @@ pub struct RenderLine {
 }
 
 pub fn trunc(s: &str, width: usize) -> String {
+    if width_of(s) <= width {
+        return s.to_string();
+    }
     if width == 0 {
         return String::new();
     }
-    if s.chars().count() > width {
-        if width == 1 {
-            return "…".to_string();
-        }
-        let mut r: String = s.chars().take(width - 1).collect();
-        r.push('…');
-        r
-    } else {
-        s.to_string()
-    }
+    format!("{}…", fit(s, width - 1))
 }
 
 pub fn pad_left(s: &str, width: usize) -> String {
     let s = trunc(s, width);
-    format!("{:<width$}", s, width = width)
+    let pad = width.saturating_sub(width_of(&s));
+    format!("{s}{}", " ".repeat(pad))
 }
 
 pub fn pad_right(s: &str, width: usize) -> String {
     let s = trunc(s, width);
-    format!("{:>width$}", s, width = width)
+    let pad = width.saturating_sub(width_of(&s));
+    format!("{}{s}", " ".repeat(pad))
 }
 
 fn pad_center(s: &str, width: usize) -> String {
     let s = trunc(s, width);
-    let total = width.saturating_sub(s.chars().count());
+    let total = width.saturating_sub(width_of(&s));
     let left = total / 2;
     let right = total - left;
     format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
@@ -53,10 +69,6 @@ pub fn render_line_string(kind: &LineKind, width: usize) -> String {
         LineKind::Right(t) => pad_right(t, width),
         LineKind::Center(t) => pad_center(t, width),
     }
-}
-
-fn char_boundary(s: &str, n: usize) -> usize {
-    s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
 }
 
 /// Greedy word-wrap, keeping the line breaks of `text`. Words longer than `width` are hard-broken.
@@ -71,24 +83,23 @@ fn wrap_line(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
-        if word.chars().count() > width {
+        if width_of(word) > width {
             if !current.is_empty() {
                 lines.push(std::mem::take(&mut current));
             }
             let mut rest = word;
-            while rest.chars().count() > width {
-                let at = char_boundary(rest, width);
+            while width_of(rest) > width {
+                // At least one char per line, even wider than `width`.
+                let head = fit(rest, width);
+                let at = if head.is_empty() { rest.chars().next().map_or(rest.len(), char::len_utf8) } else { head.len() };
                 lines.push(rest[..at].to_string());
                 rest = &rest[at..];
             }
             current = rest.to_string();
             continue;
         }
-        let candidate_len = if current.is_empty() {
-            word.chars().count()
-        } else {
-            current.chars().count() + 1 + word.chars().count()
-        };
+        let candidate_len =
+            if current.is_empty() { width_of(word) } else { width_of(&current) + 1 + width_of(word) };
         if candidate_len > width {
             lines.push(std::mem::take(&mut current));
             current = word.to_string();
@@ -143,6 +154,9 @@ pub fn build_discussion_lines(discussion: &Discussion, width: usize) -> Vec<Rend
             for l in wrap_text(&m.text, width) {
                 out.push(RenderLine { msg_idx: Some(idx), kind: LineKind::Right(l) });
             }
+            if !m.reactions.is_empty() {
+                out.push(RenderLine { msg_idx: Some(idx), kind: LineKind::Right(m.reaction_summary()) });
+            }
             out.push(RenderLine { msg_idx: Some(idx), kind: LineKind::Right(time_str) });
         } else {
             out.push(RenderLine { msg_idx: Some(idx), kind: LineKind::Left(m.sender_name.clone()) });
@@ -151,6 +165,9 @@ pub fn build_discussion_lines(discussion: &Discussion, width: usize) -> Vec<Rend
             }
             for l in wrap_text(&m.text, width) {
                 out.push(RenderLine { msg_idx: Some(idx), kind: LineKind::Left(l) });
+            }
+            if !m.reactions.is_empty() {
+                out.push(RenderLine { msg_idx: Some(idx), kind: LineKind::Left(m.reaction_summary()) });
             }
             out.push(RenderLine { msg_idx: Some(idx), kind: LineKind::Left(time_str) });
         }
@@ -169,6 +186,15 @@ pub fn build_discussion_lines(discussion: &Discussion, width: usize) -> Vec<Rend
 #[cfg(test)]
 mod tests {
     use super::wrap_text;
+
+    #[test]
+    fn emoji_take_two_columns() {
+        use super::{pad_left, pad_right, trunc, width_of};
+        assert_eq!(width_of("\u{1f44d} 2"), 4);
+        assert_eq!(pad_right("\u{1f44d}", 4), "  \u{1f44d}");
+        assert_eq!(width_of(&pad_left("\u{2764}\u{fe0f} 2  \u{1f44d}", 12)), 12);
+        assert_eq!(trunc("\u{1f44d}\u{1f44d}\u{1f44d}", 4), "\u{1f44d}…");
+    }
 
     #[test]
     fn wrap_keeps_line_breaks() {

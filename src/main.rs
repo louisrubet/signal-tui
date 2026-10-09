@@ -103,6 +103,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
                 let (discussion, text, reply_to, forwarded) = match action {
                     Action::Quit => break,
+                    Action::React { discussion, msg, emoji, remove } => {
+                        let target = &app.discussions[discussion].messages[msg];
+                        match signal::react(&mut manager, &threads[discussion], target, &emoji, remove).await {
+                            Ok(update) => {
+                                update.apply(&mut app.discussions[discussion]);
+                            }
+                            Err(e) => app.set_status(format!("Reaction failed: {e}")),
+                        }
+                        continue;
+                    }
                     Action::PinToggled(idx) => {
                         if let Err(e) = pins.set(&threads[idx], app.discussions[idx].pinned.is_some()) {
                             app.set_status(format!("Cannot save the pinned chats: {e}"));
@@ -156,6 +166,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     continue;
                 }
                 let Ok(thread) = Thread::try_from(&*content) else { continue };
+                if let Some(reaction) = directory.reaction(&content) {
+                    if let Some(idx) = threads.iter().position(|t| *t == thread) {
+                        reaction.apply(&mut app.discussions[idx]);
+                    }
+                    continue;
+                }
                 let is_group = matches!(thread, Thread::Group(_));
                 if directory.to_message(&content).is_none() {
                     continue;

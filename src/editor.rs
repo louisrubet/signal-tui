@@ -30,6 +30,25 @@ impl Editor {
         let s = normalize_newlines(s);
         self.text.insert_str(self.cursor, &s);
         self.cursor += s.len();
+        // Typing the closing colon of a known `:shortcode:` turns it into the emoji.
+        if s == ":" {
+            self.expand_shortcode();
+        }
+    }
+
+    /// Replaces the `:shortcode:` that ends at the cursor by its emoji, if it is known.
+    fn expand_shortcode(&mut self) {
+        let Some(body) = self.text[..self.cursor].strip_suffix(':') else { return };
+        let Some(start) = body.rfind(':') else { return };
+        let shortcode = &body[start + 1..];
+        let valid = !shortcode.is_empty() && shortcode.chars().all(|c| c.is_ascii_alphanumeric() || "_+-".contains(c));
+        if !valid {
+            return;
+        }
+        if let Some(emoji) = emoji_expander::lookup(shortcode) {
+            self.text.replace_range(start..self.cursor, emoji);
+            self.cursor = start + emoji.len();
+        }
     }
 
     pub fn backspace(&mut self) {
@@ -150,6 +169,16 @@ mod tests {
         e.down();
         e.down();
         assert_eq!(e.cursor_line_col(), (2, 10));
+    }
+
+    #[test]
+    fn typed_shortcodes_become_emoji() {
+        let mut e = Editor::default();
+        for c in "go :rocket: at 10:30: :nope:".chars() {
+            e.insert(c.encode_utf8(&mut [0; 4]));
+        }
+        assert_eq!(e.text(), "go \u{1f680} at 10:30: :nope:");
+        assert_eq!(e.cursor_line_col(), (0, e.text().chars().count()));
     }
 
     #[test]
