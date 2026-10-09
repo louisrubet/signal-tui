@@ -53,8 +53,8 @@ enum Screen {
         scroll: usize,
         /// `Some` while the user is typing a new message.
         composing: Option<Compose>,
-        /// `Some` while picking a reaction: the shortcode typed so far.
-        reacting: Option<String>,
+        /// `Some` while picking a reaction.
+        reacting: Option<Picker>,
         /// Index and number of the messages that were new when it was opened.
         new_from: Option<(usize, usize)>,
     },
@@ -94,6 +94,13 @@ impl Compose {
 /// The reactions Signal offers first, picked with 1 to 6.
 const QUICK_REACTIONS: [&str; 6] =
     ["\u{2764}\u{fe0f}", "\u{1f44d}", "\u{1f44e}", "\u{1f602}", "\u{1f62e}", "\u{1f622}"];
+
+/// The reaction picker: shortcode typed so far, and the emoji under the cursor.
+#[derive(Default)]
+struct Picker {
+    filter: String,
+    cursor: usize,
+}
 
 /// Emoji whose shortcode starts with `filter` (an exact shortcode first), one per emoji.
 fn reaction_matches(filter: &str) -> Vec<(&'static str, &'static str)> {
@@ -259,24 +266,45 @@ impl App {
             },
             Screen::Discussion { discussion_idx, selected_msg, composing, reacting, .. } => {
                 let messages = &discussions[*discussion_idx].messages;
-                if let Some(filter) = reacting {
+                if let Some(picker) = reacting {
+                    // Browsing only goes through the matches of a typed shortcode.
+                    let matches = if picker.filter.is_empty() { Vec::new() } else { reaction_matches(&picker.filter) };
+                    let count = matches.len();
                     let pick = match key.code {
                         KeyCode::Esc => {
                             *reacting = None;
                             None
                         }
-                        KeyCode::Char(c @ '1'..='6') if filter.is_empty() => {
+                        KeyCode::Char(c @ '1'..='6') if picker.filter.is_empty() => {
                             Some(QUICK_REACTIONS[c as usize - '1' as usize])
                         }
                         KeyCode::Char(c) if c.is_alphanumeric() || "_+-".contains(c) => {
-                            filter.extend(c.to_lowercase());
+                            picker.filter.extend(c.to_lowercase());
+                            picker.cursor = 0;
                             None
                         }
                         KeyCode::Backspace => {
-                            filter.pop();
+                            picker.filter.pop();
+                            picker.cursor = 0;
                             None
                         }
-                        KeyCode::Enter => reaction_matches(filter).first().map(|(_, emoji)| *emoji),
+                        KeyCode::Left => {
+                            picker.cursor = picker.cursor.saturating_sub(1);
+                            None
+                        }
+                        KeyCode::Right => {
+                            picker.cursor = (picker.cursor + 1).min(count.saturating_sub(1));
+                            None
+                        }
+                        KeyCode::Home => {
+                            picker.cursor = 0;
+                            None
+                        }
+                        KeyCode::End => {
+                            picker.cursor = count.saturating_sub(1);
+                            None
+                        }
+                        KeyCode::Enter => matches.get(picker.cursor).map(|(_, emoji)| *emoji),
                         _ => None,
                     };
                     let emoji = pick?;
@@ -344,7 +372,7 @@ impl App {
                         KeyCode::Char('q') => return Some(Action::Quit),
                         // Actions on the selected message (there is none in an empty discussion).
                         KeyCode::Char('r' | 'f' | 'c' | 'o' | 'e') if messages.is_empty() => {}
-                        KeyCode::Char('e') => *reacting = Some(String::new()),
+                        KeyCode::Char('e') => *reacting = Some(Picker::default()),
                         KeyCode::Char('r') => {
                             *composing = Some(Compose::new("", Some(*selected_msg)))
                         }
@@ -459,7 +487,7 @@ impl App {
                     *selected_msg,
                     scroll,
                     composing.as_ref(),
-                    reacting.as_deref(),
+                    reacting.as_ref(),
                     self.status.as_deref(),
                     w,
                     h,
@@ -683,6 +711,52 @@ fn draw_settings(
     Ok(())
 }
 
+/// The picker footer: the quick reactions until a shortcode is typed; then the matches
+/// around the cursor (the one under it in brackets, with its shortcode), position and keys.
+fn picker_line(picker: &Picker, width: usize) -> String {
+    if picker.filter.is_empty() {
+        let quick: Vec<String> =
+            QUICK_REACTIONS.iter().enumerate().map(|(i, emoji)| format!("{} {emoji}", i + 1)).collect();
+        return format!("React: {}   or type a shortcode   Esc cancel", quick.join("  "));
+    }
+    let matches = reaction_matches(&picker.filter);
+    let head = format!("React :{}  ", picker.filter);
+    if matches.is_empty() {
+        return format!("{head}no match   Backspace edit   Esc cancel");
+    }
+    let tail = format!("  {}/{}  \u{2190}/\u{2192} browse  Enter pick  Esc", picker.cursor + 1, matches.len());
+    let items: Vec<String> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, (short, emoji))| {
+            // Only the emoji under the cursor shows its shortcode, so that many fit.
+            if i == picker.cursor { format!("[{emoji} {short}]") } else { format!(" {emoji} ") }
+        })
+        .collect();
+
+    // As many emoji as fit around the cursor.
+    let avail = width.saturating_sub(ui::width_of(&head) + ui::width_of(&tail));
+    let (mut start, mut end) = (picker.cursor, picker.cursor + 1);
+    let mut used = ui::width_of(&items[picker.cursor]);
+    loop {
+        let mut grew = false;
+        if end < items.len() && used + ui::width_of(&items[end]) <= avail {
+            used += ui::width_of(&items[end]);
+            end += 1;
+            grew = true;
+        }
+        if start > 0 && used + ui::width_of(&items[start - 1]) <= avail {
+            start -= 1;
+            used += ui::width_of(&items[start]);
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    format!("{head}{}{tail}", items[start..end].concat())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_discussion(
     out: &mut impl Write,
@@ -694,8 +768,8 @@ fn draw_discussion(
     selected_msg: usize,
     scroll: &mut usize,
     composing: Option<&Compose>,
-    // The shortcode typed so far while picking a reaction.
-    reacting: Option<&str>,
+    // The reaction picker, while picking.
+    reacting: Option<&Picker>,
     status: Option<&str>,
     w: u16,
     h: u16,
@@ -736,17 +810,7 @@ fn draw_discussion(
             rows
         }
         None => match reacting {
-            Some("") => {
-                let quick: Vec<String> =
-                    QUICK_REACTIONS.iter().enumerate().map(|(i, emoji)| format!("{} {emoji}", i + 1)).collect();
-                vec![format!("React: {}   or type a shortcode   Esc cancel", quick.join("  "))]
-            }
-            Some(filter) => {
-                let matches: Vec<String> =
-                    reaction_matches(filter).iter().take(8).map(|(short, emoji)| format!("{emoji} {short}")).collect();
-                let matches = if matches.is_empty() { "no match".to_string() } else { matches.join("  ") };
-                vec![format!("React :{filter}  \u{2192} {matches}   Enter first")]
-            }
+            Some(picker) => vec![picker_line(picker, width)],
             None => {
                 let help = "\u{2191}/\u{2193} navigate   r reply   e react   f forward   c copy   o open links   Enter new message   Esc back   q quit";
                 vec![status.unwrap_or(help).to_string()]
@@ -1050,7 +1114,7 @@ mod tests {
         let mut app = opened();
         let last = app.discussions[0].messages.len() - 1;
         app.handle_key(key(KeyCode::Char('e')));
-        assert!(screen(&mut app).contains("React:"));
+        assert!(screen(&mut app).contains("React: 1 \u{2764}\u{fe0f}  2 \u{1f44d}"), "quick reactions shown");
         let react = app.handle_key(key(KeyCode::Char('2')));
         let thumbs_up = "\u{1f44d}".to_string();
         assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji: thumbs_up.clone(), remove: false }));
@@ -1066,6 +1130,34 @@ mod tests {
         app.handle_key(key(KeyCode::Char('e')));
         let react = app.handle_key(key(KeyCode::Char('2')));
         assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji: thumbs_up, remove: true }));
+    }
+
+    #[test]
+    fn arrows_browse_all_the_matches_of_a_filter() {
+        let mut app = opened();
+        let last = app.discussions[0].messages.len() - 1;
+        app.handle_key(key(KeyCode::Char('e')));
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), None, "no browsing before a shortcode is typed");
+
+        let matches = reaction_matches("s");
+        assert!(matches.len() > 50, "every match, not a few: {}", matches.len());
+        type_text(&mut app, "s");
+        assert!(screen(&mut app).contains(&format!("1/{}", matches.len())));
+        for _ in 0..7 {
+            app.handle_key(key(KeyCode::Right));
+        }
+        app.handle_key(key(KeyCode::Left));
+        assert!(screen(&mut app).contains(&format!("[{} {}]", matches[6].1, matches[6].0)));
+        let react = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji: matches[6].1.to_string(), remove: false }));
+
+        app.handle_key(key(KeyCode::Char('e')));
+        type_text(&mut app, "s");
+        app.handle_key(key(KeyCode::End));
+        let react = app.handle_key(key(KeyCode::Enter));
+        let emoji = matches[matches.len() - 1].1.to_string();
+        assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji, remove: false }));
     }
 
     #[test]
