@@ -340,6 +340,13 @@ impl App {
                         }
                         KeyCode::Backspace => editor.backspace(),
                         KeyCode::Delete => editor.delete(),
+                        // Word by word with Alt (macOS habit) or Ctrl (Linux, Windows).
+                        KeyCode::Left if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                            editor.word_left()
+                        }
+                        KeyCode::Right if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                            editor.word_right()
+                        }
                         KeyCode::Left => editor.left(),
                         KeyCode::Right => editor.right(),
                         KeyCode::Up => editor.up(),
@@ -948,6 +955,21 @@ mod tests {
         assert_eq!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), None);
         let send = app.handle_key(key(KeyCode::Enter));
         assert_eq!(send, Some(Action::Send { discussion: 0, text: "bc".to_string(), reply_to: None }));
+    }
+
+    #[test]
+    fn alt_or_ctrl_arrows_move_by_word() {
+        let mut app = opened();
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "one two");
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        type_text(&mut app, "big ");
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        type_text(&mut app, "!");
+        let send = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "one! big two".to_string(), reply_to: None }));
     }
 
     #[test]

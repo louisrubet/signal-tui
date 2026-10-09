@@ -72,6 +72,27 @@ impl Editor {
         self.cursor = self.next_boundary().unwrap_or(self.cursor);
     }
 
+    /// Start of the previous word (words are letters, digits and `_`).
+    pub fn word_left(&mut self) {
+        let before: Vec<(usize, char)> = self.text[..self.cursor].char_indices().collect();
+        let mut i = before.len();
+        while i > 0 && !is_word(before[i - 1].1) {
+            i -= 1;
+        }
+        while i > 0 && is_word(before[i - 1].1) {
+            i -= 1;
+        }
+        self.cursor = before.get(i).map_or(self.cursor, |(at, _)| *at);
+    }
+
+    /// End of the next word.
+    pub fn word_right(&mut self) {
+        let mut rest = self.text[self.cursor..].char_indices().peekable();
+        while rest.next_if(|(_, c)| !is_word(*c)).is_some() {}
+        while rest.next_if(|(_, c)| is_word(*c)).is_some() {}
+        self.cursor += rest.peek().map_or(self.text.len() - self.cursor, |(at, _)| *at);
+    }
+
     pub fn home(&mut self) {
         self.cursor = self.line_start(self.cursor);
     }
@@ -123,6 +144,10 @@ impl Editor {
         let line = &self.text[start..self.line_end(start)];
         start + line.char_indices().nth(col).map_or(line.len(), |(i, _)| i)
     }
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Pasted text can come with `\r\n` or `\r` line ends.
@@ -179,6 +204,32 @@ mod tests {
         }
         assert_eq!(e.text(), "go \u{1f680} at 10:30: :nope:");
         assert_eq!(e.cursor_line_col(), (0, e.text().chars().count()));
+    }
+
+    #[test]
+    fn word_moves() {
+        let mut e = Editor::new("Bonjour, le monde\nété 2026");
+        e.word_left();
+        assert_eq!(e.cursor_line_col(), (1, 4), "start of 2026");
+        e.word_left();
+        assert_eq!(e.cursor_line_col(), (1, 0), "start of été, over the space");
+        e.word_left();
+        assert_eq!(e.cursor_line_col(), (0, 12), "start of monde, over the line break");
+        e.word_left();
+        e.word_left();
+        assert_eq!(e.cursor_line_col(), (0, 0), "over the comma");
+        e.word_left();
+        assert_eq!(e.cursor_line_col(), (0, 0), "stays at the start");
+        e.word_right();
+        assert_eq!(e.cursor_line_col(), (0, 7), "end of Bonjour");
+        e.word_right();
+        assert_eq!(e.cursor_line_col(), (0, 11), "end of le");
+        e.word_right();
+        e.word_right();
+        assert_eq!(e.cursor_line_col(), (1, 3), "end of été");
+        e.word_right();
+        e.word_right();
+        assert_eq!(e.cursor_line_col(), (1, 8), "stays at the end");
     }
 
     #[test]
