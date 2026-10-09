@@ -83,12 +83,79 @@ struct Compose {
     editor: Editor,
     /// Message being replied to, in the current discussion.
     reply_to: Option<usize>,
+    /// `Some` while completing a `:shortcode`.
+    completion: Option<Completion>,
+}
+
+/// Emoji completion of the `:shortcode` being typed.
+struct Completion {
+    /// Byte index of its `:` in the draft.
+    start: usize,
+    /// Match under the cursor.
+    cursor: usize,
 }
 
 impl Compose {
     fn new(text: &str, reply_to: Option<usize>) -> Self {
-        Compose { editor: Editor::new(text), reply_to }
+        Compose { editor: Editor::new(text), reply_to, completion: None }
     }
+
+    /// The shortcode typed after the `:` of the completion, lowercased like the table.
+    fn completion_filter(&self) -> Option<String> {
+        let completion = self.completion.as_ref()?;
+        Some(self.editor.text().get(completion.start + 1..self.editor.cursor())?.to_ascii_lowercase())
+    }
+
+    /// Handles a key while completing; `false` when the key is for the editor instead
+    /// (the completion is then over).
+    fn complete(&mut self, key: KeyEvent) -> bool {
+        let Some(filter) = self.completion_filter() else { return false };
+        let matches = reaction_matches(&filter);
+        let Some(completion) = &mut self.completion else { return false };
+        match key.code {
+            // Leaves the text as typed, `:` included.
+            KeyCode::Esc => self.completion = None,
+            KeyCode::Left => completion.cursor = completion.cursor.saturating_sub(1),
+            KeyCode::Right => completion.cursor = (completion.cursor + 1).min(matches.len().saturating_sub(1)),
+            // Shift/Alt+Enter still adds a line (and ends the completion).
+            KeyCode::Enter | KeyCode::Tab if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+                if let Some((_, emoji)) = matches.get(completion.cursor) {
+                    let start = completion.start;
+                    self.editor.replace_to_cursor(start, emoji);
+                }
+                self.completion = None;
+            }
+            KeyCode::Char(c) if is_shortcode_char(c) && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.editor.insert(c.encode_utf8(&mut [0; 4]));
+                completion.cursor = 0;
+            }
+            KeyCode::Backspace => {
+                self.editor.backspace();
+                completion.cursor = 0;
+                if self.editor.cursor() <= completion.start {
+                    self.completion = None;
+                }
+            }
+            _ => {
+                self.completion = None;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// After typing a `:`: starts a completion when it begins a word (not in `10:30`).
+    fn maybe_start_completion(&mut self) {
+        let before = &self.editor.text()[..self.editor.cursor()];
+        let Some(rest) = before.strip_suffix(':') else { return };
+        if rest.chars().next_back().is_none_or(char::is_whitespace) {
+            self.completion = Some(Completion { start: rest.len(), cursor: 0 });
+        }
+    }
+}
+
+fn is_shortcode_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "_+-".contains(c)
 }
 
 /// The reactions Signal offers first, picked with 1 to 6.
@@ -319,6 +386,9 @@ impl App {
                     });
                 }
                 if let Some(compose) = composing {
+                    if compose.complete(key) {
+                        return None;
+                    }
                     let editor = &mut compose.editor;
                     match key.code {
                         KeyCode::Esc => *composing = None,
@@ -355,7 +425,10 @@ impl App {
                         KeyCode::End => editor.end(),
                         // Ctrl+letter is a shortcut, not text (Ctrl+C must not type a "c").
                         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            editor.insert(c.encode_utf8(&mut [0; 4]))
+                            editor.insert(c.encode_utf8(&mut [0; 4]));
+                            if c == ':' {
+                                compose.maybe_start_completion();
+                            }
                         }
                         _ => {}
                     }
@@ -460,7 +533,10 @@ impl App {
         self.status = None;
         if let Screen::Discussion { composing, .. } = &mut self.screen {
             match composing {
-                Some(compose) => compose.editor.insert(text),
+                Some(compose) => {
+                    compose.completion = None;
+                    compose.editor.insert(text)
+                }
                 None => *composing = Some(Compose::new(text, None)),
             }
         }
@@ -726,25 +802,38 @@ fn picker_line(picker: &Picker, width: usize) -> String {
             QUICK_REACTIONS.iter().enumerate().map(|(i, emoji)| format!("{} {emoji}", i + 1)).collect();
         return format!("React: {}   or type a shortcode   Esc cancel", quick.join("  "));
     }
-    let matches = reaction_matches(&picker.filter);
-    let head = format!("React :{}  ", picker.filter);
+    matches_line(&format!("React :{}  ", picker.filter), &picker.filter, picker.cursor, width)
+}
+
+/// The completion line above the draft while a `:shortcode` is typed.
+fn completion_line(filter: &str, cursor: usize, width: usize) -> String {
+    if filter.is_empty() {
+        return ":  type a shortcode   Esc cancel".to_string();
+    }
+    matches_line(&format!(":{filter}  "), filter, cursor, width)
+}
+
+/// `head`, then the emoji matching `filter` around `cursor` (the one under it in brackets,
+/// with its shortcode), position and keys.
+fn matches_line(head: &str, filter: &str, cursor: usize, width: usize) -> String {
+    let matches = reaction_matches(filter);
     if matches.is_empty() {
         return format!("{head}no match   Backspace edit   Esc cancel");
     }
-    let tail = format!("  {}/{}  \u{2190}/\u{2192} browse  Enter pick  Esc", picker.cursor + 1, matches.len());
+    let tail = format!("  {}/{}  \u{2190}/\u{2192} browse  Enter pick  Esc", cursor + 1, matches.len());
     let items: Vec<String> = matches
         .iter()
         .enumerate()
         .map(|(i, (short, emoji))| {
             // Only the emoji under the cursor shows its shortcode, so that many fit.
-            if i == picker.cursor { format!("[{emoji} {short}]") } else { format!(" {emoji} ") }
+            if i == cursor { format!("[{emoji} {short}]") } else { format!(" {emoji} ") }
         })
         .collect();
 
     // As many emoji as fit around the cursor.
-    let avail = width.saturating_sub(ui::width_of(&head) + ui::width_of(&tail));
-    let (mut start, mut end) = (picker.cursor, picker.cursor + 1);
-    let mut used = ui::width_of(&items[picker.cursor]);
+    let avail = width.saturating_sub(ui::width_of(head) + ui::width_of(&tail));
+    let (mut start, mut end) = (cursor, cursor + 1);
+    let mut used = ui::width_of(&items[cursor]);
     loop {
         let mut grew = false;
         if end < items.len() && used + ui::width_of(&items[end]) <= avail {
@@ -788,17 +877,19 @@ fn draw_discussion(
     // (at most half the screen, showing the end of the draft).
     let mut cursor_pos = None;
     let footer: Vec<String> = match composing {
-        Some(Compose { editor, reply_to }) => {
+        Some(compose @ Compose { editor, reply_to, .. }) => {
             let prompt = match reply_to.and_then(|i| discussion.messages.get(i)) {
                 Some(m) if m.from_me => "Reply to yourself> ".to_string(),
                 Some(m) => format!("Reply to {}> ", m.sender_name),
                 None => "> ".to_string(),
             };
-            let indent = " ".repeat(prompt.chars().count());
+            let indent = " ".repeat(ui::width_of(&prompt));
             let avail = width.saturating_sub(indent.len()).max(1);
             let max_rows = (height.saturating_sub(HEADER) / 2).max(1);
             let draft: Vec<&str> = editor.text().split('\n').collect();
-            let (cursor_line, cursor_col) = editor.cursor_line_col();
+            let (cursor_line, _) = editor.cursor_line_col();
+            // In screen columns: an emoji takes two.
+            let cursor_col = ui::width_of(editor.line_before_cursor());
             // Rows shown: the end of the draft, or up to the cursor line if it is higher.
             let first = draft.len().saturating_sub(max_rows).min(cursor_line);
             // The cursor line scrolls sideways to keep the cursor visible.
@@ -809,12 +900,17 @@ fn draw_discussion(
                 .map(|(i, line)| {
                     let lead = if first + i == 0 { &prompt } else { &indent };
                     let skip = if first + i == cursor_line { offset } else { 0 };
-                    format!("{lead}{}", line.chars().skip(skip).take(avail).collect::<String>())
+                    format!("{lead}{}", ui::columns(line, skip, avail))
                 })
                 .collect();
             let col = indent.len() + cursor_col - offset;
-            cursor_pos = Some((col.min(width.saturating_sub(1)), cursor_line - first));
-            rows
+            // The completion line goes above the draft.
+            let completion = compose.completion_filter().map(|filter| {
+                completion_line(&filter, compose.completion.as_ref().map_or(0, |c| c.cursor), width)
+            });
+            let above = usize::from(completion.is_some());
+            cursor_pos = Some((col.min(width.saturating_sub(1)), cursor_line - first + above));
+            completion.into_iter().chain(rows).collect()
         }
         None => match reacting {
             Some(picker) => vec![picker_line(picker, width)],
@@ -970,6 +1066,54 @@ mod tests {
         type_text(&mut app, "!");
         let send = app.handle_key(key(KeyCode::Enter));
         assert_eq!(send, Some(Action::Send { discussion: 0, text: "one! big two".to_string(), reply_to: None }));
+    }
+
+    #[test]
+    fn colon_completes_emoji() {
+        let mut app = opened();
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "go :ro");
+        assert!(screen(&mut app).contains(":ro  [\u{1f680} rocket]"));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), None, "Enter picks, does not send");
+        type_text(&mut app, " now");
+        let send = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "go \u{1f680} now".to_string(), reply_to: None }));
+    }
+
+    #[test]
+    fn esc_leaves_the_typed_colon() {
+        let mut app = opened();
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "a :ro");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!screen(&mut app).contains("[\u{1f680} rocket]"), "completion closed");
+        let send = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "a :ro".to_string(), reply_to: None }));
+    }
+
+    #[test]
+    fn no_completion_inside_words() {
+        let mut app = opened();
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "at 10:30");
+        assert!(!screen(&mut app).contains("type a shortcode"));
+        type_text(&mut app, " :");
+        assert!(screen(&mut app).contains("type a shortcode"));
+        type_text(&mut app, " ok");
+        assert!(!screen(&mut app).contains("type a shortcode"), "a space ends it");
+    }
+
+    #[test]
+    fn cursor_is_placed_after_wide_emoji() {
+        let mut app = opened();
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "a :rocket: b");
+        let mut out = Vec::new();
+        app.draw(&mut out, 80, 30).unwrap();
+        // The draw ends with the cursor move: "> a 🚀 b" takes 8 columns (the rocket two),
+        // so the cursor goes to column 8, written 9 by the 1-based escape sequence.
+        let tail = String::from_utf8(out).unwrap();
+        assert!(tail.ends_with("\x1b[30;9H\x1b[?25h"), "{:?}", &tail[tail.len().saturating_sub(20)..]);
     }
 
     #[test]
