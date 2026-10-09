@@ -14,7 +14,12 @@ pub struct Message {
     pub forwarded: bool,
     /// Emoji reactions, one per author.
     pub reactions: Vec<Reaction>,
+    /// Deleted for everyone: shown as "This message was deleted".
+    pub deleted: bool,
 }
+
+/// How long after sending a message can be deleted for everyone (Signal's default limit).
+pub const DELETE_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// An emoji reaction to a message.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,7 +44,20 @@ impl Message {
             reply_to,
             forwarded,
             reactions: Vec::new(),
+            deleted: false,
         }
+    }
+
+    /// Whether we can delete it for everyone at `now_ms`: ours, sent less than 24 h ago.
+    pub fn deletable(&self, now_ms: u64) -> bool {
+        self.from_me && !self.deleted && now_ms.saturating_sub(self.id) < DELETE_MAX_AGE_MS
+    }
+
+    /// Deleted for everyone: its text and reactions go away.
+    pub fn mark_deleted(&mut self) {
+        self.deleted = true;
+        self.text.clear();
+        self.reactions.clear();
     }
 
     /// Sets the reaction of `author` (replacing theirs), or removes it with `None`.
@@ -135,6 +153,7 @@ fn msg(from_me: bool, sender_name: &str, text: &str, ts: &str) -> Message {
         reply_to: None,
         forwarded: false,
         reactions: Vec::new(),
+        deleted: false,
     }
 }
 

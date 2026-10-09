@@ -13,7 +13,8 @@ fn main() -> io::Result<()> {
     let mut app = App::new(data::mock_discussions());
     let _terminal = TerminalGuard::enter()?;
     let mut out = stdout();
-    let mut next_id = 1;
+    // Message ids are send times in ms, as in Signal (deletion is allowed for 24 h).
+    let mut next_id = chrono::Utc::now().timestamp_millis() as u64;
 
     loop {
         let (w, h) = terminal::size()?;
@@ -30,6 +31,7 @@ fn main() -> io::Result<()> {
         };
         match action {
             Some(Action::Quit) => return Ok(()),
+            Some(Action::Delete { discussion, msg }) => app.discussions[discussion].messages[msg].mark_deleted(),
             Some(Action::React { discussion, msg, emoji, remove }) => {
                 let emoji = (!remove).then_some(emoji.as_str());
                 app.discussions[discussion].messages[msg].set_reaction("me", true, emoji);

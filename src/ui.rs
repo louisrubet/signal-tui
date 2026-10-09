@@ -152,6 +152,7 @@ pub fn build_discussion_lines(discussion: &Discussion, width: usize, new_from: O
         }
 
         let time_str = m.timestamp.format("%H:%M").to_string();
+        let text = if m.deleted { "This message was deleted" } else { m.text.as_str() };
 
         // "Forwarded" label and quoted message, shown above the text (truncated to one line).
         let mut header = Vec::new();
@@ -160,14 +161,15 @@ pub fn build_discussion_lines(discussion: &Discussion, width: usize, new_from: O
         }
         if let Some(quoted) = m.reply_to.and_then(|i| discussion.messages.get(i)) {
             let name = if quoted.from_me { "You" } else { &quoted.sender_name };
-            header.push(format!("\u{21b3} {name}: {}", quoted.text));
+            let quoted_text = if quoted.deleted { "This message was deleted" } else { quoted.text.as_str() };
+            header.push(format!("\u{21b3} {name}: {quoted_text}"));
         }
 
         if m.from_me {
             for h in header {
                 out.push(RenderLine { msg_idx: Some(idx), kind: LineKind::Right(h) });
             }
-            for l in wrap_text(&m.text, width) {
+            for l in wrap_text(text, width) {
                 out.push(RenderLine { msg_idx: Some(idx), kind: LineKind::Right(l) });
             }
             if !m.reactions.is_empty() {
@@ -179,7 +181,7 @@ pub fn build_discussion_lines(discussion: &Discussion, width: usize, new_from: O
             for h in header {
                 out.push(RenderLine { msg_idx: Some(idx), kind: LineKind::Left(h) });
             }
-            for l in wrap_text(&m.text, width) {
+            for l in wrap_text(text, width) {
                 out.push(RenderLine { msg_idx: Some(idx), kind: LineKind::Left(l) });
             }
             if !m.reactions.is_empty() {

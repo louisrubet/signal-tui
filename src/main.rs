@@ -113,6 +113,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         }
                         continue;
                     }
+                    Action::Delete { discussion, msg } => {
+                        let target = &app.discussions[discussion].messages[msg];
+                        match signal::delete(&mut manager, &threads[discussion], target).await {
+                            Ok(()) => app.discussions[discussion].messages[msg].mark_deleted(),
+                            Err(e) => app.set_status(format!("Deletion failed: {e}")),
+                        }
+                        continue;
+                    }
                     Action::PinToggled(idx) => {
                         if let Err(e) = pins.set(&threads[idx], app.discussions[idx].pinned.is_some()) {
                             app.set_status(format!("Cannot save the pinned chats: {e}"));
@@ -166,6 +174,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     continue;
                 }
                 let Ok(thread) = Thread::try_from(&*content) else { continue };
+                if let Some((target, author)) = directory.deletion(&content) {
+                    // Only its author can delete a message.
+                    if let Some(idx) = threads.iter().position(|t| *t == thread)
+                        && let Some(message) =
+                            app.discussions[idx].messages.iter_mut().find(|m| m.id == target && m.author.as_ref() == Some(&author))
+                    {
+                        message.mark_deleted();
+                    }
+                    continue;
+                }
                 if let Some(reaction) = directory.reaction(&content) {
                     if let Some(idx) = threads.iter().position(|t| *t == thread) {
                         reaction.apply(&mut app.discussions[idx]);
