@@ -18,6 +18,22 @@ impl Editor {
         &self.text
     }
 
+    /// Byte index of the cursor in [`Editor::text`].
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Replaces the text from byte `start` up to the cursor by `with`.
+    pub fn replace_to_cursor(&mut self, start: usize, with: &str) {
+        self.text.replace_range(start..self.cursor, with);
+        self.cursor = start + with.len();
+    }
+
+    /// The text of the cursor line, before the cursor.
+    pub fn line_before_cursor(&self) -> &str {
+        &self.text[self.line_start(self.cursor)..self.cursor]
+    }
+
     /// Line and column (in chars) of the cursor.
     pub fn cursor_line_col(&self) -> (usize, usize) {
         let before = &self.text[..self.cursor];

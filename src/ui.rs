@@ -7,6 +7,12 @@ pub fn width_of(s: &str) -> usize {
     s.width()
 }
 
+/// The part of `s` starting `skip` columns in, at most `width` columns wide.
+pub fn columns(s: &str, skip: usize, width: usize) -> &str {
+    let start = s.char_indices().map(|(i, _)| i).find(|&i| width_of(&s[..i]) >= skip).unwrap_or(s.len());
+    fit(&s[start..], width)
+}
+
 /// Longest prefix of `s` that fits in `width` columns.
 fn fit(s: &str, width: usize) -> &str {
     let mut end = 0;
