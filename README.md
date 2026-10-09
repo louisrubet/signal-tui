@@ -22,7 +22,6 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 |---|---|
 | `↑` `↓` | select chat / message |
 | `Enter` | open chat, new message, send |
-| `Shift+Enter` / `Alt+Enter` | new line |
 | `r` | reply to the selected message |
 | `e` | react to the selected message (`1`–`6` or a `:shortcode:`) |
 | `f` | forward the selected message |
