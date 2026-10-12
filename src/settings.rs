@@ -11,7 +11,9 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { notifications: true }
+        Settings {
+            notifications: true,
+        }
     }
 }
 
@@ -30,7 +32,9 @@ impl Settings {
     pub fn load(path: &Path) -> Self {
         let mut settings = Settings::default();
         for line in std::fs::read_to_string(path).unwrap_or_default().lines() {
-            let Some((key, value)) = line.split_once('=') else { continue };
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
             if let ("notifications", Ok(value)) = (key.trim(), value.trim().parse()) {
                 settings.notifications = value;
             }
@@ -56,7 +60,9 @@ mod tests {
         let path = dir.path().join("signal-tui").join("settings");
         assert_eq!(Settings::load(&path), Settings::default());
 
-        let settings = Settings { notifications: false };
+        let settings = Settings {
+            notifications: false,
+        };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
     }

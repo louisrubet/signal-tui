@@ -10,7 +10,11 @@ use qrcode::QrCode;
 pub fn print_qr(data: &str) {
     const QUIET_ZONE: usize = 4;
     const BLACK: Color = Color::Rgb { r: 0, g: 0, b: 0 };
-    const WHITE: Color = Color::Rgb { r: 255, g: 255, b: 255 };
+    const WHITE: Color = Color::Rgb {
+        r: 255,
+        g: 255,
+        b: 255,
+    };
 
     let code = QrCode::new(data).expect("data too long for a QR code");
     let width = code.width();
@@ -25,7 +29,12 @@ pub fn print_qr(data: &str) {
     // Each character holds two modules: the upper one as foreground of '▀', the lower as background.
     for y in (0..size).step_by(2) {
         let line: String = (0..size)
-            .map(|x| format!("{}", '▀'.with(color(is_dark(x, y))).on(color(is_dark(x, y + 1)))))
+            .map(|x| {
+                format!(
+                    "{}",
+                    '▀'.with(color(is_dark(x, y))).on(color(is_dark(x, y + 1)))
+                )
+            })
             .collect();
         println!("{line}");
     }

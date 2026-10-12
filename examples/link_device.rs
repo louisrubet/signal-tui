@@ -32,7 +32,9 @@ async fn async_main() {
         None => {}
         Some("--reset") => {
             signal::remove_store(db).expect("cannot delete the store");
-            println!("Store {db} deleted. Also remove the old \"signal-tui\" device from the phone (Settings > Linked devices).");
+            println!(
+                "Store {db} deleted. Also remove the old \"signal-tui\" device from the phone (Settings > Linked devices)."
+            );
         }
         Some(arg) => {
             eprintln!("unknown argument {arg:?}\nusage: link_device [--reset]");
@@ -52,18 +54,31 @@ async fn async_main() {
     let whoami = manager.whoami().await.expect("whoami request failed");
     eprintln!("Connected as {}. Syncing\u{2026}", whoami.aci);
 
-    let seen = signal::sync(&mut manager, Duration::from_secs(15)).await.expect("sync failed");
-    let conversations = signal::conversations(&manager, seen).await.expect("cannot read the store");
+    let seen = signal::sync(&mut manager, Duration::from_secs(15))
+        .await
+        .expect("sync failed");
+    let conversations = signal::conversations(&manager, seen)
+        .await
+        .expect("cannot read the store");
 
     // One line per conversation: date of the last message, title, message count, last message.
     for c in &conversations {
-        let date = c.last_message.as_ref().map_or_else(|| " ".repeat(16), |(t, _)| t.format("%Y-%m-%d %H:%M").to_string());
+        let date = c.last_message.as_ref().map_or_else(
+            || " ".repeat(16),
+            |(t, _)| t.format("%Y-%m-%d %H:%M").to_string(),
+        );
         let kind = match c.thread {
             signal::Thread::Group(_) => "group",
             signal::Thread::Contact(_) => "",
         };
-        let last = c.last_message.as_ref().map_or(String::new(), |(_, text)| text.replace('\n', " "));
-        println!("{date}  {:<30} {kind:<5} {:>4} msg  {last}", c.title, c.message_count);
+        let last = c
+            .last_message
+            .as_ref()
+            .map_or(String::new(), |(_, text)| text.replace('\n', " "));
+        println!(
+            "{date}  {:<30} {kind:<5} {:>4} msg  {last}",
+            c.title, c.message_count
+        );
     }
     eprintln!("{} conversation(s)", conversations.len());
 }

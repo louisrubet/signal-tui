@@ -3,7 +3,9 @@
 //! [`App`] holds the state and draws it; [`App::handle_key`] turns key presses into
 //! [`Action`]s that the caller carries out (sending through Signal, or locally for the mock).
 
+use std::fs;
 use std::io::{self, Write, stdout};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -20,6 +22,7 @@ use crossterm::{
 
 use crate::data::{self, Discussion, Message, Styled};
 use crate::editor::Editor;
+use crate::graphics::Thumbnails;
 use crate::settings::Settings;
 use crate::ui;
 
@@ -30,25 +33,53 @@ pub enum Action {
     /// Discussion opened: its messages are now read.
     Opened(usize),
     /// Send `text` in `discussion`, quoting message `reply_to` of that discussion.
-    Send { discussion: usize, text: String, styles: Vec<Styled>, reply_to: Option<usize> },
+    Send {
+        discussion: usize,
+        text: String,
+        styles: Vec<Styled>,
+        reply_to: Option<usize>,
+    },
     /// Send the text of message `msg` of discussion `from` to discussion `to`.
-    Forward { from: usize, msg: usize, to: usize },
+    Forward {
+        from: usize,
+        msg: usize,
+        to: usize,
+    },
     /// [`App::settings`] changed: save them.
     SettingsChanged,
     /// The discussion was pinned or unpinned ([`Discussion::pinned`]): save it.
     PinToggled(usize),
     /// Set our reaction `emoji` to message `msg` of `discussion`, or remove it.
-    React { discussion: usize, msg: usize, emoji: String, remove: bool },
+    React {
+        discussion: usize,
+        msg: usize,
+        emoji: String,
+        remove: bool,
+    },
     /// Delete our message `msg` of `discussion` for everyone (confirmed).
-    Delete { discussion: usize, msg: usize },
+    Delete {
+        discussion: usize,
+        msg: usize,
+    },
+    /// Paste an image from the system clipboard as a textual placeholder.
+    PasteImageFromClipboard,
+    /// Download the received attachments of message `msg` of `discussion`, then open them.
+    FetchAttachments {
+        discussion: usize,
+        msg: usize,
+    },
+    /// Send a message with uploaded attachments.
+    SendWithAttachments {
+        discussion: usize,
+        text: String,
+        attachments: Vec<data::Attachment>,
+        reply_to: Option<usize>,
+    },
 }
 
 enum Screen {
     /// The chats. `selected` is a discussion index (here and in `Forward`).
-    List {
-        selected: usize,
-        scroll: usize,
-    },
+    List { selected: usize, scroll: usize },
     Discussion {
         discussion_idx: usize,
         selected_msg: usize,
@@ -71,21 +102,20 @@ enum Screen {
         scroll: usize,
     },
     /// The parameters, opened from the discussion list (`back_to` is its selection).
-    Settings {
-        selected: usize,
-        back_to: usize,
-    },
+    Settings { selected: usize, back_to: usize },
 }
 
 /// A parameter shown on the parameters screen: label and the setting it toggles.
 type Toggle = (&'static str, fn(&mut Settings) -> &mut bool);
 
 /// The parameters shown, in order.
-const SETTINGS: [Toggle; 1] =
-    [("Desktop notifications for new messages", |s| &mut s.notifications)];
+const SETTINGS: [Toggle; 1] = [("Desktop notifications for new messages", |s| {
+    &mut s.notifications
+})];
 
 struct Compose {
     editor: Editor,
+    attachments: Vec<data::Attachment>,
     /// Message being replied to, in the current discussion.
     reply_to: Option<usize>,
     /// `Some` while completing a `:shortcode`.
@@ -102,35 +132,57 @@ struct Completion {
 
 impl Compose {
     fn new(text: &str, reply_to: Option<usize>) -> Box<Self> {
-        Box::new(Compose { editor: Editor::new(text), reply_to, completion: None })
+        Box::new(Compose {
+            editor: Editor::new(text),
+            attachments: Vec::new(),
+            reply_to,
+            completion: None,
+        })
     }
 
     /// The shortcode typed after the `:` of the completion, lowercased like the table.
     fn completion_filter(&self) -> Option<String> {
         let completion = self.completion.as_ref()?;
-        Some(self.editor.text().get(completion.start + 1..self.editor.cursor())?.to_ascii_lowercase())
+        Some(
+            self.editor
+                .text()
+                .get(completion.start + 1..self.editor.cursor())?
+                .to_ascii_lowercase(),
+        )
     }
 
     /// Handles a key while completing; `false` when the key is for the editor instead
     /// (the completion is then over).
     fn complete(&mut self, key: KeyEvent) -> bool {
-        let Some(filter) = self.completion_filter() else { return false };
+        let Some(filter) = self.completion_filter() else {
+            return false;
+        };
         let matches = reaction_matches(&filter);
-        let Some(completion) = &mut self.completion else { return false };
+        let Some(completion) = &mut self.completion else {
+            return false;
+        };
         match key.code {
             // Leaves the text as typed, `:` included.
             KeyCode::Esc => self.completion = None,
             KeyCode::Left => completion.cursor = completion.cursor.saturating_sub(1),
-            KeyCode::Right => completion.cursor = (completion.cursor + 1).min(matches.len().saturating_sub(1)),
+            KeyCode::Right => {
+                completion.cursor = (completion.cursor + 1).min(matches.len().saturating_sub(1))
+            }
             // Shift/Alt+Enter still adds a line (and ends the completion).
-            KeyCode::Enter | KeyCode::Tab if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            KeyCode::Enter | KeyCode::Tab
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
                 if let Some((_, emoji)) = matches.get(completion.cursor) {
                     let start = completion.start;
                     self.editor.replace_to_cursor(start, emoji);
                 }
                 self.completion = None;
             }
-            KeyCode::Char(c) if is_shortcode_char(c) && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if is_shortcode_char(c) && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.editor.insert(c.encode_utf8(&mut [0; 4]));
                 completion.cursor = 0;
             }
@@ -152,9 +204,14 @@ impl Compose {
     /// After typing a `:`: starts a completion when it begins a word (not in `10:30`).
     fn maybe_start_completion(&mut self) {
         let before = &self.editor.text()[..self.editor.cursor()];
-        let Some(rest) = before.strip_suffix(':') else { return };
+        let Some(rest) = before.strip_suffix(':') else {
+            return;
+        };
         if rest.chars().next_back().is_none_or(char::is_whitespace) {
-            self.completion = Some(Completion { start: rest.len(), cursor: 0 });
+            self.completion = Some(Completion {
+                start: rest.len(),
+                cursor: 0,
+            });
         }
     }
 }
@@ -164,8 +221,14 @@ fn is_shortcode_char(c: char) -> bool {
 }
 
 /// The reactions Signal offers first, picked with 1 to 6.
-const QUICK_REACTIONS: [&str; 6] =
-    ["\u{2764}\u{fe0f}", "\u{1f44d}", "\u{1f44e}", "\u{1f602}", "\u{1f62e}", "\u{1f622}"];
+const QUICK_REACTIONS: [&str; 6] = [
+    "\u{2764}\u{fe0f}",
+    "\u{1f44d}",
+    "\u{1f44e}",
+    "\u{1f602}",
+    "\u{1f62e}",
+    "\u{1f622}",
+];
 
 /// The reaction picker: shortcode typed so far, and the emoji under the cursor.
 #[derive(Default)]
@@ -176,7 +239,9 @@ struct Picker {
 
 /// Emoji whose shortcode starts with `filter` (an exact shortcode first), one per emoji.
 fn reaction_matches(filter: &str) -> Vec<(&'static str, &'static str)> {
-    let exact = emoji_expander::EMOJIS.get_key_value(filter).map(|(k, v)| (*k, *v));
+    let exact = emoji_expander::EMOJIS
+        .get_key_value(filter)
+        .map(|(k, v)| (*k, *v));
     let mut matches: Vec<(&str, &str)> = Vec::new();
     for (shortcode, emoji) in exact.into_iter().chain(emoji_expander::search(filter)) {
         if !matches.iter().any(|(_, e)| *e == emoji) {
@@ -210,6 +275,8 @@ pub struct App {
     list_page: usize,
     /// Messages to jump by a page in a discussion, from the last draw (PageUp / PageDown).
     message_page: usize,
+    /// Image thumbnails shown in the discussions (off unless the terminal supports them).
+    pub thumbnails: Thumbnails,
 }
 
 impl App {
@@ -219,16 +286,111 @@ impl App {
             discussions,
             settings: Settings::default(),
             typing: Vec::new(),
-            screen: Screen::List { selected: first, scroll: 0 },
+            screen: Screen::List {
+                selected: first,
+                scroll: 0,
+            },
             status: None,
             clipboard: None,
             list_page: 10,
             message_page: 5,
+            thumbnails: Thumbnails::default(),
         }
     }
 
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = Some(status.into());
+    }
+
+    fn selected_message_with_quote(&self) -> Option<(&Message, Option<&Message>)> {
+        let Screen::Discussion {
+            discussion_idx,
+            selected_msg,
+            ..
+        } = self.screen
+        else {
+            return None;
+        };
+        let messages = &self.discussions.get(discussion_idx)?.messages;
+        let message = messages.get(selected_msg)?;
+        let quoted = message.reply_to.and_then(|i| messages.get(i));
+        Some((message, quoted))
+    }
+
+    fn attachment_path(message_id: u64, index: usize, attachment: &data::Attachment) -> PathBuf {
+        let from_name = attachment
+            .file_name
+            .as_deref()
+            .and_then(|name| Path::new(name).extension())
+            .and_then(|ext| ext.to_str());
+        let extension = match attachment.content_type.as_str() {
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            "image/png" => "png",
+            _ => from_name.unwrap_or("bin"),
+        };
+        std::env::temp_dir()
+            .join("signal-tui")
+            .join(format!("{message_id}-{index}.{extension}"))
+    }
+
+    fn write_openable_attachments(message: &Message) -> Vec<String> {
+        let dir = std::env::temp_dir().join("signal-tui");
+        if fs::create_dir_all(&dir).is_err() {
+            return Vec::new();
+        }
+        message
+            .attachments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, attachment)| {
+                let path = Self::attachment_path(message.id, index, attachment);
+                fs::write(&path, &attachment.bytes).ok()?;
+                Some(path.to_string_lossy().into_owned())
+            })
+            .collect()
+    }
+
+    fn open_targets(message: &Message, quoted: Option<&Message>) -> Vec<String> {
+        let mut targets: Vec<String> = data::links(&message.text)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for link in quoted.map_or(Vec::new(), |q| data::links(&q.text)) {
+            if !targets.iter().any(|target| target == link) {
+                targets.push(link.to_string());
+            }
+        }
+        targets.extend(Self::write_openable_attachments(message));
+        if let Some(quoted) = quoted {
+            targets.extend(Self::write_openable_attachments(quoted));
+        }
+        targets
+    }
+
+    /// Opens the links and attachments of the selected message (and of the one it quotes).
+    pub fn open_selection(&mut self) {
+        let targets = self
+            .selected_message_with_quote()
+            .map(|(message, quoted)| Self::open_targets(message, quoted))
+            .unwrap_or_default();
+        let failed = targets
+            .iter()
+            .filter(|target| open::that_detached(target).is_err())
+            .count();
+        self.status = Some(match (targets.len(), failed) {
+            (0, _) => "No link or attachment in this message".to_string(),
+            (n, 0) => format!("Opened {n} link(s)/attachment(s)"),
+            (n, f) => format!("Could not open {f} of {n} link(s)/attachment(s)"),
+        });
+    }
+
+    #[cfg(test)]
+    fn open_targets_for_selection(&self) -> Vec<String> {
+        self.selected_message_with_quote()
+            .map(|(message, quoted)| Self::open_targets(message, quoted))
+            .unwrap_or_default()
     }
 
     /// Adds a discussion at the end of the list and returns its index.
@@ -238,11 +400,24 @@ impl App {
     }
 
     /// `author` (named `name`) started or stopped typing in `discussion`.
-    pub fn set_typing(&mut self, discussion: usize, author: &str, name: &str, started: bool, now: Instant) {
-        self.typing.retain(|t| !(t.discussion == discussion && t.author == author));
+    pub fn set_typing(
+        &mut self,
+        discussion: usize,
+        author: &str,
+        name: &str,
+        started: bool,
+        now: Instant,
+    ) {
+        self.typing
+            .retain(|t| !(t.discussion == discussion && t.author == author));
         if started {
             let (author, name) = (author.to_string(), name.to_string());
-            self.typing.push(Typing { discussion, author, name, until: now + TYPING_TIMEOUT });
+            self.typing.push(Typing {
+                discussion,
+                author,
+                name,
+                until: now + TYPING_TIMEOUT,
+            });
         }
     }
 
@@ -271,14 +446,19 @@ impl App {
         let from_me = message.from_me;
         // Their message arrived: they are done typing it.
         if let Some(author) = &message.author {
-            self.typing.retain(|t| !(t.discussion == discussion && t.author == *author));
+            self.typing
+                .retain(|t| !(t.discussion == discussion && t.author == *author));
         }
         target.messages.push(message);
         let last = target.messages.len() - 1;
         if !open && !from_me {
             target.unread += 1;
         }
-        if let Screen::Discussion { discussion_idx, selected_msg, .. } = &mut self.screen
+        if let Screen::Discussion {
+            discussion_idx,
+            selected_msg,
+            ..
+        } = &mut self.screen
             && *discussion_idx == discussion
             && (from_me || *selected_msg == was_last)
         {
@@ -297,8 +477,13 @@ impl App {
         {
             // Opens on the first new message, below a "N new messages" line.
             let discussion = &mut self.discussions[selected];
-            let new_from = discussion.first_unread().map(|first| (first, discussion.unread));
-            let selected_msg = new_from.map_or(discussion.messages.len().saturating_sub(1), |(first, _)| first);
+            let new_from = discussion
+                .first_unread()
+                .map(|first| (first, discussion.unread));
+            let selected_msg = new_from
+                .map_or(discussion.messages.len().saturating_sub(1), |(first, _)| {
+                    first
+                });
             discussion.unread = 0;
             self.screen = Screen::Discussion {
                 discussion_idx: selected,
@@ -317,12 +502,21 @@ impl App {
             Screen::List { selected, .. } => match key.code {
                 KeyCode::Up => *selected = step(discussions, *selected, -1),
                 KeyCode::Down => *selected = step(discussions, *selected, 1),
-                KeyCode::PageUp => *selected = step(discussions, *selected, -(self.list_page as isize)),
-                KeyCode::PageDown => *selected = step(discussions, *selected, self.list_page as isize),
+                KeyCode::PageUp => {
+                    *selected = step(discussions, *selected, -(self.list_page as isize))
+                }
+                KeyCode::PageDown => {
+                    *selected = step(discussions, *selected, self.list_page as isize)
+                }
                 KeyCode::Char('P') if *selected < discussions.len() => {
                     let idx = *selected;
                     // Pinning again puts the chat at the end of the pinned list.
-                    let next_rank = self.discussions.iter().filter_map(|d| d.pinned).max().map_or(0, |r| r + 1);
+                    let next_rank = self
+                        .discussions
+                        .iter()
+                        .filter_map(|d| d.pinned)
+                        .max()
+                        .map_or(0, |r| r + 1);
                     let discussion = &mut self.discussions[idx];
                     discussion.pinned = match discussion.pinned {
                         Some(_) => None,
@@ -332,24 +526,41 @@ impl App {
                 }
                 KeyCode::Char('p') => {
                     let back_to = *selected;
-                    self.screen = Screen::Settings { selected: 0, back_to };
+                    self.screen = Screen::Settings {
+                        selected: 0,
+                        back_to,
+                    };
                 }
                 KeyCode::Char('q') | KeyCode::Esc => return Some(Action::Quit),
                 _ => {}
             },
-            Screen::Discussion { discussion_idx, selected_msg, composing, reacting, deleting, .. } => {
+            Screen::Discussion {
+                discussion_idx,
+                selected_msg,
+                composing,
+                reacting,
+                deleting,
+                ..
+            } => {
                 let messages = &discussions[*discussion_idx].messages;
                 if *deleting {
                     *deleting = false;
                     if key.code == KeyCode::Char('y') {
-                        return Some(Action::Delete { discussion: *discussion_idx, msg: *selected_msg });
+                        return Some(Action::Delete {
+                            discussion: *discussion_idx,
+                            msg: *selected_msg,
+                        });
                     }
                     self.status = Some("Not deleted".to_string());
                     return None;
                 }
                 if let Some(picker) = reacting {
                     // Browsing only goes through the matches of a typed shortcode.
-                    let matches = if picker.filter.is_empty() { Vec::new() } else { reaction_matches(&picker.filter) };
+                    let matches = if picker.filter.is_empty() {
+                        Vec::new()
+                    } else {
+                        reaction_matches(&picker.filter)
+                    };
                     let count = matches.len();
                     let pick = match key.code {
                         KeyCode::Esc => {
@@ -412,14 +623,44 @@ impl App {
                             }
                         }
                         // Shift+Enter needs the kitty keyboard protocol; Alt+Enter works everywhere.
-                        KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+                        KeyCode::Enter
+                            if key
+                                .modifiers
+                                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                        {
                             editor.insert("\n")
                         }
                         KeyCode::Enter => {
                             let (text, styles) = data::trim_styled(editor.text(), editor.styles());
+                            if !compose.attachments.is_empty() {
+                                // The labels stand for the attachments: shown, not sent.
+                                let first = self.discussions[*discussion_idx].next_attachment();
+                                let text = compose.attachments.iter().enumerate().fold(
+                                    text,
+                                    |text, (i, attachment)| {
+                                        let label = data::attachment_label(
+                                            &attachment.content_type,
+                                            Some(first + i),
+                                        );
+                                        text.replace(&label, "")
+                                    },
+                                );
+                                let action = Action::SendWithAttachments {
+                                    discussion: *discussion_idx,
+                                    text: text.trim().to_string(),
+                                    attachments: compose.attachments.clone(),
+                                    reply_to: compose.reply_to,
+                                };
+                                *composing = None;
+                                return Some(action);
+                            }
                             if !text.is_empty() {
-                                let action =
-                                    Action::Send { discussion: *discussion_idx, text, styles, reply_to: compose.reply_to };
+                                let action = Action::Send {
+                                    discussion: *discussion_idx,
+                                    text,
+                                    styles,
+                                    reply_to: compose.reply_to,
+                                };
                                 *composing = None;
                                 return Some(action);
                             }
@@ -427,10 +668,18 @@ impl App {
                         KeyCode::Backspace => editor.backspace(),
                         KeyCode::Delete => editor.delete(),
                         // Word by word with Alt (macOS habit) or Ctrl (Linux, Windows).
-                        KeyCode::Left if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                        KeyCode::Left
+                            if key
+                                .modifiers
+                                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                        {
                             editor.word_left()
                         }
-                        KeyCode::Right if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                        KeyCode::Right
+                            if key
+                                .modifiers
+                                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                        {
                             editor.word_right()
                         }
                         KeyCode::Left => editor.left(),
@@ -439,6 +688,13 @@ impl App {
                         KeyCode::Down => editor.down(),
                         KeyCode::Home => editor.home(),
                         KeyCode::End => editor.end(),
+                        KeyCode::Char('v' | 'V')
+                            if key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                        {
+                            return Some(Action::PasteImageFromClipboard);
+                        }
                         // Ctrl+letter is a shortcut, not text (Ctrl+C must not type a "c").
                         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                             editor.insert(c.encode_utf8(&mut [0; 4]));
@@ -456,14 +712,20 @@ impl App {
                                 *selected_msg += 1;
                             }
                         }
-                        KeyCode::PageUp => *selected_msg = selected_msg.saturating_sub(self.message_page),
+                        KeyCode::PageUp => {
+                            *selected_msg = selected_msg.saturating_sub(self.message_page)
+                        }
                         KeyCode::PageDown => {
-                            *selected_msg = (*selected_msg + self.message_page).min(messages.len().saturating_sub(1))
+                            *selected_msg = (*selected_msg + self.message_page)
+                                .min(messages.len().saturating_sub(1))
                         }
                         KeyCode::Enter => *composing = Some(Compose::new("", None)),
                         KeyCode::Esc => {
                             let back_to = *discussion_idx;
-                            self.screen = Screen::List { selected: back_to, scroll: 0 };
+                            self.screen = Screen::List {
+                                selected: back_to,
+                                scroll: 0,
+                            };
                         }
                         KeyCode::Char('q') => return Some(Action::Quit),
                         // Actions on the selected message (there is none in an empty discussion).
@@ -475,7 +737,10 @@ impl App {
                             if messages[*selected_msg].deletable(now_ms) {
                                 *deleting = true;
                             } else {
-                                self.status = Some("Only your messages of the last 24 h can be deleted".to_string());
+                                self.status = Some(
+                                    "Only your messages of the last 24 h can be deleted"
+                                        .to_string(),
+                                );
                             }
                         }
                         KeyCode::Char('e') => *reacting = Some(Picker::default()),
@@ -484,28 +749,32 @@ impl App {
                         }
                         KeyCode::Char('f') => {
                             let (discussion_idx, msg_idx) = (*discussion_idx, *selected_msg);
-                            self.screen = Screen::Forward { discussion_idx, msg_idx, selected: discussion_idx, scroll: 0 };
+                            self.screen = Screen::Forward {
+                                discussion_idx,
+                                msg_idx,
+                                selected: discussion_idx,
+                                scroll: 0,
+                            };
                         }
                         KeyCode::Char('c') => {
                             self.clipboard = Some(messages[*selected_msg].text.clone());
                             self.status = Some("Message copied".to_string());
                         }
                         KeyCode::Char('o') => {
-                            // The quoted message is shown with the message: its links count too.
-                            let message = &messages[*selected_msg];
-                            let quoted = message.reply_to.and_then(|i| messages.get(i));
-                            let mut links = data::links(&message.text);
-                            for link in quoted.map_or(Vec::new(), |q| data::links(&q.text)) {
-                                if !links.contains(&link) {
-                                    links.push(link);
-                                }
+                            if !messages[*selected_msg].remote_attachments.is_empty() {
+                                return Some(Action::FetchAttachments {
+                                    discussion: *discussion_idx,
+                                    msg: *selected_msg,
+                                });
                             }
-                            let failed = links.iter().filter(|link| open::that_detached(link).is_err()).count();
-                            self.status = Some(match (links.len(), failed) {
-                                (0, _) => "No link in this message".to_string(),
-                                (n, 0) => format!("Opened {n} link(s)"),
-                                (n, f) => format!("Could not open {f} of {n} link(s)"),
-                            });
+                            self.open_selection();
+                        }
+                        KeyCode::Char('v' | 'V')
+                            if key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                        {
+                            return Some(Action::PasteImageFromClipboard);
                         }
                         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                             *composing = Some(Compose::new(c.encode_utf8(&mut [0; 4]), None))
@@ -514,22 +783,49 @@ impl App {
                     }
                 }
             }
-            Screen::Forward { discussion_idx, msg_idx, selected, .. } => match key.code {
+            Screen::Forward {
+                discussion_idx,
+                msg_idx,
+                selected,
+                ..
+            } => match key.code {
                 KeyCode::Up => *selected = step(discussions, *selected, -1),
                 KeyCode::Down => *selected = step(discussions, *selected, 1),
-                KeyCode::PageUp => *selected = step(discussions, *selected, -(self.list_page as isize)),
-                KeyCode::PageDown => *selected = step(discussions, *selected, self.list_page as isize),
+                KeyCode::PageUp => {
+                    *selected = step(discussions, *selected, -(self.list_page as isize))
+                }
+                KeyCode::PageDown => {
+                    *selected = step(discussions, *selected, self.list_page as isize)
+                }
                 KeyCode::Enter => {
-                    let action = Action::Forward { from: *discussion_idx, msg: *msg_idx, to: *selected };
+                    let action = Action::Forward {
+                        from: *discussion_idx,
+                        msg: *msg_idx,
+                        to: *selected,
+                    };
                     let (discussion_idx, selected_msg) = (*discussion_idx, *msg_idx);
-                    self.screen =
-                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None, deleting: false, new_from: None };
+                    self.screen = Screen::Discussion {
+                        discussion_idx,
+                        selected_msg,
+                        scroll: 0,
+                        composing: None,
+                        reacting: None,
+                        deleting: false,
+                        new_from: None,
+                    };
                     return Some(action);
                 }
                 KeyCode::Esc => {
                     let (discussion_idx, selected_msg) = (*discussion_idx, *msg_idx);
-                    self.screen =
-                        Screen::Discussion { discussion_idx, selected_msg, scroll: 0, composing: None, reacting: None, deleting: false, new_from: None };
+                    self.screen = Screen::Discussion {
+                        discussion_idx,
+                        selected_msg,
+                        scroll: 0,
+                        composing: None,
+                        reacting: None,
+                        deleting: false,
+                        new_from: None,
+                    };
                 }
                 _ => {}
             },
@@ -543,7 +839,10 @@ impl App {
                 }
                 KeyCode::Esc | KeyCode::Char('p') => {
                     let selected = *back_to;
-                    self.screen = Screen::List { selected, scroll: 0 };
+                    self.screen = Screen::List {
+                        selected,
+                        scroll: 0,
+                    };
                 }
                 KeyCode::Char('q') => return Some(Action::Quit),
                 _ => {}
@@ -568,6 +867,31 @@ impl App {
         }
     }
 
+    /// Pasted images are displayed as a placeholder while the binary payload is kept for sending.
+    pub fn handle_pasted_image(&mut self, attachment: data::Attachment) {
+        self.status = None;
+        if let Screen::Discussion {
+            discussion_idx,
+            composing,
+            ..
+        } = &mut self.screen
+        {
+            if composing.is_none() {
+                *composing = Some(Compose::new("", None));
+            }
+            if let Some(compose) = composing {
+                compose.completion = None;
+                let number =
+                    self.discussions[*discussion_idx].next_attachment() + compose.attachments.len();
+                compose.editor.insert(&data::attachment_label(
+                    &attachment.content_type,
+                    Some(number),
+                ));
+                compose.attachments.push(attachment);
+            }
+        }
+    }
+
     /// Draws the current screen on a `w` x `h` terminal.
     pub fn draw(&mut self, out: &mut impl Write, w: u16, h: u16) -> io::Result<()> {
         if let Some(text) = self.clipboard.take() {
@@ -587,12 +911,28 @@ impl App {
                 w,
                 h,
             ),
-            Screen::Discussion { discussion_idx, selected_msg, scroll, composing, reacting, deleting, new_from } => {
+            Screen::Discussion {
+                discussion_idx,
+                selected_msg,
+                scroll,
+                composing,
+                reacting,
+                deleting,
+                new_from,
+            } => {
+                self.thumbnails
+                    .send(out, &self.discussions[*discussion_idx].messages)?;
                 let visible = draw_discussion(
                     out,
                     &self.discussions[*discussion_idx],
+                    &self.thumbnails,
                     *new_from,
-                    &self.typing.iter().filter(|t| t.discussion == *discussion_idx).map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                    &self
+                        .typing
+                        .iter()
+                        .filter(|t| t.discussion == *discussion_idx)
+                        .map(|t| t.name.as_str())
+                        .collect::<Vec<_>>(),
                     *selected_msg,
                     scroll,
                     composing.as_deref(),
@@ -606,7 +946,9 @@ impl App {
                 self.message_page = visible.saturating_sub(1).max(1);
                 Ok(())
             }
-            Screen::Forward { selected, scroll, .. } => draw_list(
+            Screen::Forward {
+                selected, scroll, ..
+            } => draw_list(
                 out,
                 &self.discussions,
                 &typing,
@@ -617,9 +959,14 @@ impl App {
                 w,
                 h,
             ),
-            Screen::Settings { selected, .. } => {
-                draw_settings(out, &mut self.settings, *selected, self.status.as_deref(), w, h)
-            }
+            Screen::Settings { selected, .. } => draw_settings(
+                out,
+                &mut self.settings,
+                *selected,
+                self.status.as_deref(),
+                w,
+                h,
+            ),
         }
     }
 }
@@ -637,7 +984,10 @@ impl TerminalGuard {
         // Lets the terminal report Shift+Enter distinctly from Enter (kitty keyboard protocol).
         let enhanced_keys = terminal::supports_keyboard_enhancement().unwrap_or(false);
         if enhanced_keys {
-            execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
+            execute!(
+                out,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
         }
         // Pastes arrive as one event, so their line breaks do not act as Enter.
         execute!(out, EnableBracketedPaste)?;
@@ -668,9 +1018,19 @@ fn print_row(out: &mut impl Write, y: u16, text: &str, selected: bool) -> io::Re
 }
 
 /// Prints `text` on row `y`, its `styles` as terminal attributes (bold, italic, crossed out).
-fn print_styled(out: &mut impl Write, y: u16, text: &str, styles: &[Styled], selected: bool) -> io::Result<()> {
+fn print_styled(
+    out: &mut impl Write,
+    y: u16,
+    text: &str,
+    styles: &[Styled],
+    selected: bool,
+) -> io::Result<()> {
     queue!(out, cursor::MoveTo(0, y))?;
-    let mut cuts: Vec<usize> = styles.iter().flat_map(|s| [s.start, s.end]).filter(|&at| at < text.len()).collect();
+    let mut cuts: Vec<usize> = styles
+        .iter()
+        .flat_map(|s| [s.start, s.end])
+        .filter(|&at| at < text.len())
+        .collect();
     cuts.extend([0, text.len()]);
     cuts.sort_unstable();
     cuts.dedup();
@@ -723,7 +1083,9 @@ fn unread_badge(n: usize) -> String {
 /// The discussion `delta` places away from `selected` in display order (clamped).
 fn step(discussions: &[Discussion], selected: usize, delta: isize) -> usize {
     let order = order(discussions);
-    let Some(pos) = order.iter().position(|&i| i == selected) else { return order.first().copied().unwrap_or(0) };
+    let Some(pos) = order.iter().position(|&i| i == selected) else {
+        return order.first().copied().unwrap_or(0);
+    };
     order[pos.saturating_add_signed(delta).min(order.len() - 1)]
 }
 
@@ -782,7 +1144,10 @@ fn draw_list(
     let rows = list_rows(discussions, title);
 
     // Keep the selected chat in view, with its section title when it is the first one.
-    let sel_row = rows.iter().position(|r| matches!(r, Row::Chat(i) if *i == selected)).unwrap_or(0);
+    let sel_row = rows
+        .iter()
+        .position(|r| matches!(r, Row::Chat(i) if *i == selected))
+        .unwrap_or(0);
     let mut top = sel_row;
     while top > 0 && !matches!(rows[top - 1], Row::Chat(_)) {
         top -= 1;
@@ -802,8 +1167,11 @@ fn draw_list(
             Some(Row::Chat(idx)) => {
                 let idx = *idx;
                 let discussion = &discussions[idx];
-                let title =
-                    if typing.contains(&idx) { format!("{} ...", discussion.title) } else { discussion.title.clone() };
+                let title = if typing.contains(&idx) {
+                    format!("{} ...", discussion.title)
+                } else {
+                    discussion.title.clone()
+                };
                 // Number of new messages in front, right-aligned in a 4-column prefix: "  ③ ", "50+ ".
                 let text = format!(
                     "{} {}",
@@ -836,10 +1204,20 @@ fn draw_settings(
     print_row(out, 0, &ui::pad_left("Parameters", width), false)?;
     for (i, (label, value)) in SETTINGS.iter().enumerate() {
         let mark = if *value(settings) { "x" } else { " " };
-        print_row(out, (HEADER + i) as u16, &ui::pad_left(&format!("[{mark}] {label}"), width), i == selected)?;
+        print_row(
+            out,
+            (HEADER + i) as u16,
+            &ui::pad_left(&format!("[{mark}] {label}"), width),
+            i == selected,
+        )?;
     }
     let help = "\u{2191}/\u{2193} select   Space/Enter toggle   Esc back   q quit";
-    print_row(out, (height - 1) as u16, &ui::pad_left(status.unwrap_or(help), width), false)?;
+    print_row(
+        out,
+        (height - 1) as u16,
+        &ui::pad_left(status.unwrap_or(help), width),
+        false,
+    )?;
     Ok(())
 }
 
@@ -847,11 +1225,22 @@ fn draw_settings(
 /// around the cursor (the one under it in brackets, with its shortcode), position and keys.
 fn picker_line(picker: &Picker, width: usize) -> String {
     if picker.filter.is_empty() {
-        let quick: Vec<String> =
-            QUICK_REACTIONS.iter().enumerate().map(|(i, emoji)| format!("{} {emoji}", i + 1)).collect();
-        return format!("React: {}   or type a shortcode   Esc cancel", quick.join("  "));
+        let quick: Vec<String> = QUICK_REACTIONS
+            .iter()
+            .enumerate()
+            .map(|(i, emoji)| format!("{} {emoji}", i + 1))
+            .collect();
+        return format!(
+            "React: {}   or type a shortcode   Esc cancel",
+            quick.join("  ")
+        );
     }
-    matches_line(&format!("React :{}  ", picker.filter), &picker.filter, picker.cursor, width)
+    matches_line(
+        &format!("React :{}  ", picker.filter),
+        &picker.filter,
+        picker.cursor,
+        width,
+    )
 }
 
 /// The completion line above the draft while a `:shortcode` is typed.
@@ -869,13 +1258,21 @@ fn matches_line(head: &str, filter: &str, cursor: usize, width: usize) -> String
     if matches.is_empty() {
         return format!("{head}no match   Backspace edit   Esc cancel");
     }
-    let tail = format!("  {}/{}  \u{2190}/\u{2192} browse  Enter pick  Esc", cursor + 1, matches.len());
+    let tail = format!(
+        "  {}/{}  \u{2190}/\u{2192} browse  Enter pick  Esc",
+        cursor + 1,
+        matches.len()
+    );
     let items: Vec<String> = matches
         .iter()
         .enumerate()
         .map(|(i, (short, emoji))| {
             // Only the emoji under the cursor shows its shortcode, so that many fit.
-            if i == cursor { format!("[{emoji} {short}]") } else { format!(" {emoji} ") }
+            if i == cursor {
+                format!("[{emoji} {short}]")
+            } else {
+                format!(" {emoji} ")
+            }
         })
         .collect();
 
@@ -906,6 +1303,7 @@ fn matches_line(head: &str, filter: &str, cursor: usize, width: usize) -> String
 fn draw_discussion(
     out: &mut impl Write,
     discussion: &Discussion,
+    thumbnails: &Thumbnails,
     // Where the "N new messages" line goes (index, count).
     new_from: Option<(usize, usize)>,
     // Names of the people typing.
@@ -929,7 +1327,11 @@ fn draw_discussion(
     let mut cursor_pos = None;
     // Footer rows with their styles (only the draft has some).
     let footer: Vec<(String, Vec<Styled>)> = match composing {
-        Some(compose @ Compose { editor, reply_to, .. }) => {
+        Some(
+            compose @ Compose {
+                editor, reply_to, ..
+            },
+        ) => {
             let prompt = match reply_to.and_then(|i| discussion.messages.get(i)) {
                 Some(m) if m.from_me => "Reply to yourself> ".to_string(),
                 Some(m) => format!("Reply to {}> ", m.sender_name),
@@ -947,7 +1349,8 @@ fn draw_discussion(
             let first = draft.len().saturating_sub(max_rows).min(cursor_line);
             // The cursor line scrolls sideways to keep the cursor visible.
             let offset = cursor_col.saturating_sub(avail - 1);
-            let rows: Vec<(String, Vec<Styled>)> = draft[first..(first + max_rows).min(draft.len())]
+            let rows: Vec<(String, Vec<Styled>)> = draft
+                [first..(first + max_rows).min(draft.len())]
                 .iter()
                 .enumerate()
                 .map(|(i, line)| {
@@ -956,22 +1359,38 @@ fn draw_discussion(
                     let shown = ui::columns(line, skip, avail);
                     // Where `shown` is in the draft, for its styles.
                     let at = shown.as_ptr() as usize - text.as_ptr() as usize;
-                    (format!("{lead}{shown}"), ui::styles_in(editor.styles(), at..at + shown.len(), lead.len()))
+                    (
+                        format!("{lead}{shown}"),
+                        ui::styles_in(editor.styles(), at..at + shown.len(), lead.len()),
+                    )
                 })
                 .collect();
             let col = indent.len() + cursor_col - offset;
             // The completion line goes above the draft.
             let completion = compose.completion_filter().map(|filter| {
-                (completion_line(&filter, compose.completion.as_ref().map_or(0, |c| c.cursor), width), Vec::new())
+                (
+                    completion_line(
+                        &filter,
+                        compose.completion.as_ref().map_or(0, |c| c.cursor),
+                        width,
+                    ),
+                    Vec::new(),
+                )
             });
             let above = usize::from(completion.is_some());
-            cursor_pos = Some((col.min(width.saturating_sub(1)), cursor_line - first + above));
+            cursor_pos = Some((
+                col.min(width.saturating_sub(1)),
+                cursor_line - first + above,
+            ));
             completion.into_iter().chain(rows).collect()
         }
         None => match reacting {
             Some(picker) => vec![(picker_line(picker, width), Vec::new())],
             None if deleting => {
-                vec![("Delete this message for everyone?   y yes   any other key: no".to_string(), Vec::new())]
+                vec![(
+                    "Delete this message for everyone?   y yes   any other key: no".to_string(),
+                    Vec::new(),
+                )]
             }
             None => {
                 let help = "\u{2191}/\u{2193} navigate   r reply   e react   f forward   c copy   o open links   Del delete   Enter new message   Esc back   q quit";
@@ -981,7 +1400,7 @@ fn draw_discussion(
     };
     let viewport = height.saturating_sub(HEADER + footer.len()).max(1);
 
-    let mut lines = ui::build_discussion_lines(discussion, width, new_from);
+    let mut lines = ui::build_discussion_lines(discussion, width, new_from, thumbnails);
 
     let mut sel_min = None;
     let mut sel_max = None;
@@ -999,7 +1418,10 @@ fn draw_discussion(
         if !lines.is_empty() {
             lines.push(ui::RenderLine::new(None, ui::LineKind::Left(String::new())));
         }
-        lines.push(ui::RenderLine::new(None, ui::LineKind::Left(format!("{} ...", typing.join(", ")))));
+        lines.push(ui::RenderLine::new(
+            None,
+            ui::LineKind::Left(format!("{} ...", typing.join(", "))),
+        ));
         if selected_msg + 1 >= discussion.messages.len() {
             sel_max = lines.len() - 1;
         }
@@ -1028,7 +1450,9 @@ fn draw_discussion(
             let rl = &lines[idx];
             visible_messages.extend(rl.msg_idx);
             let (text, styles) = ui::render_line(rl, width);
-            let selected = rl.msg_idx == Some(selected_msg);
+            // Reversed, the placeholders would lose their color: the image id.
+            let selected =
+                rl.msg_idx == Some(selected_msg) && !matches!(rl.kind, ui::LineKind::Image { .. });
             print_styled(out, y, &text, &styles, selected)?;
         } else {
             print_row(out, y, &" ".repeat(width), false)?;
@@ -1037,10 +1461,20 @@ fn draw_discussion(
 
     let footer_y = height.saturating_sub(footer.len());
     for (row, (text, styles)) in footer.iter().enumerate() {
-        print_styled(out, (footer_y + row) as u16, &ui::pad_left(text, width), styles, false)?;
+        print_styled(
+            out,
+            (footer_y + row) as u16,
+            &ui::pad_left(text, width),
+            styles,
+            false,
+        )?;
     }
     if let Some((col, row)) = cursor_pos {
-        queue!(out, cursor::MoveTo(col as u16, (footer_y + row) as u16), cursor::Show)?;
+        queue!(
+            out,
+            cursor::MoveTo(col as u16, (footer_y + row) as u16),
+            cursor::Show
+        )?;
     }
     // Messages at least partly on screen.
     Ok(visible_messages.len())
@@ -1071,10 +1505,26 @@ mod tests {
         }
     }
 
+    fn image_attachment() -> data::Attachment {
+        data::Attachment {
+            content_type: "image/png".to_string(),
+            file_name: Some("clipboard.png".to_string()),
+            bytes: vec![1, 2, 3],
+            width: Some(1),
+            height: Some(1),
+        }
+    }
+
     #[test]
     fn quit_from_list_and_discussion() {
-        assert_eq!(app().handle_key(key(KeyCode::Char('q'))), Some(Action::Quit));
-        assert_eq!(opened().handle_key(key(KeyCode::Char('q'))), Some(Action::Quit));
+        assert_eq!(
+            app().handle_key(key(KeyCode::Char('q'))),
+            Some(Action::Quit)
+        );
+        assert_eq!(
+            opened().handle_key(key(KeyCode::Char('q'))),
+            Some(Action::Quit)
+        );
     }
 
     #[test]
@@ -1083,7 +1533,15 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         type_text(&mut app, " hello ");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "hello".to_string(), styles: vec![], reply_to: None }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 0,
+                text: "hello".to_string(),
+                styles: vec![],
+                reply_to: None
+            })
+        );
     }
 
     #[test]
@@ -1091,10 +1549,21 @@ mod tests {
         let mut app = opened();
         app.handle_key(key(KeyCode::Enter));
         type_text(&mut app, "a");
-        assert_eq!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)), None);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            None
+        );
         type_text(&mut app, "b");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "a\nb".to_string(), styles: vec![], reply_to: None }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 0,
+                text: "a\nb".to_string(),
+                styles: vec![],
+                reply_to: None
+            })
+        );
     }
 
     #[test]
@@ -1107,9 +1576,20 @@ mod tests {
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Delete));
         app.handle_key(key(KeyCode::End));
-        assert_eq!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), None);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            None
+        );
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "bc".to_string(), styles: vec![], reply_to: None }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 0,
+                text: "bc".to_string(),
+                styles: vec![],
+                reply_to: None
+            })
+        );
     }
 
     #[test]
@@ -1124,7 +1604,15 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
         type_text(&mut app, "!");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "one! big two".to_string(), styles: vec![], reply_to: None }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 0,
+                text: "one! big two".to_string(),
+                styles: vec![],
+                reply_to: None
+            })
+        );
     }
 
     #[test]
@@ -1133,10 +1621,22 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         type_text(&mut app, "go :ro");
         assert!(screen(&mut app).contains(":ro  [\u{1f916} robot_face]"));
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), None, "Enter picks, does not send");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            None,
+            "Enter picks, does not send"
+        );
         type_text(&mut app, " now");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "go \u{1f916} now".to_string(), styles: vec![], reply_to: None }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 0,
+                text: "go \u{1f916} now".to_string(),
+                styles: vec![],
+                reply_to: None
+            })
+        );
     }
 
     #[test]
@@ -1145,9 +1645,20 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         type_text(&mut app, "a :ro");
         app.handle_key(key(KeyCode::Esc));
-        assert!(!screen(&mut app).contains("[\u{1f680} rocket]"), "completion closed");
+        assert!(
+            !screen(&mut app).contains("[\u{1f680} rocket]"),
+            "completion closed"
+        );
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "a :ro".to_string(), styles: vec![], reply_to: None }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 0,
+                text: "a :ro".to_string(),
+                styles: vec![],
+                reply_to: None
+            })
+        );
     }
 
     #[test]
@@ -1159,7 +1670,10 @@ mod tests {
         type_text(&mut app, " :");
         assert!(screen(&mut app).contains("type a shortcode"));
         type_text(&mut app, " ok");
-        assert!(!screen(&mut app).contains("type a shortcode"), "a space ends it");
+        assert!(
+            !screen(&mut app).contains("type a shortcode"),
+            "a space ends it"
+        );
     }
 
     #[test]
@@ -1172,7 +1686,11 @@ mod tests {
         // The draw ends with the cursor move: "> a 🚀 b" takes 8 columns (the rocket two),
         // so the cursor goes to column 8, written 9 by the 1-based escape sequence.
         let tail = String::from_utf8(out).unwrap();
-        assert!(tail.ends_with("\x1b[30;9H\x1b[?25h"), "{:?}", &tail[tail.len().saturating_sub(20)..]);
+        assert!(
+            tail.ends_with("\x1b[30;9H\x1b[?25h"),
+            "{:?}",
+            &tail[tail.len().saturating_sub(20)..]
+        );
     }
 
     #[test]
@@ -1182,11 +1700,31 @@ mod tests {
         type_text(&mut app, " **tout** *a* ~b~");
         let send = app.handle_key(key(KeyCode::Enter));
         let styles = vec![
-            Styled { start: 0, end: 4, style: data::Style::Bold },
-            Styled { start: 5, end: 6, style: data::Style::Italic },
-            Styled { start: 7, end: 8, style: data::Style::Strikethrough },
+            Styled {
+                start: 0,
+                end: 4,
+                style: data::Style::Bold,
+            },
+            Styled {
+                start: 5,
+                end: 6,
+                style: data::Style::Italic,
+            },
+            Styled {
+                start: 7,
+                end: 8,
+                style: data::Style::Strikethrough,
+            },
         ];
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "tout a b".to_string(), styles, reply_to: None }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 0,
+                text: "tout a b".to_string(),
+                styles,
+                reply_to: None
+            })
+        );
     }
 
     #[test]
@@ -1197,14 +1735,28 @@ mod tests {
         type_text(&mut app, "**gras**");
         let mut out = Vec::new();
         app.draw(&mut out, 80, 30).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains(&format!("{bold}gras")), "in the draft");
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains(&format!("{bold}gras")),
+            "in the draft"
+        );
 
         let last = app.discussions[0].messages.len() - 1;
         let message = &mut app.discussions[0].messages[last];
-        message.styles = vec![Styled { start: 0, end: 7, style: data::Style::Bold }];
+        message.styles = vec![Styled {
+            start: 0,
+            end: 7,
+            style: data::Style::Bold,
+        }];
         let mut out = Vec::new();
         app.draw(&mut out, 80, 30).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains(&format!("{bold}Morning")), "in a post");
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains(&format!("{bold}Morning")),
+            "in a post"
+        );
     }
 
     #[test]
@@ -1214,7 +1766,15 @@ mod tests {
         type_text(&mut app, "**x**");
         app.handle_key(key(KeyCode::Esc));
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "**x**".to_string(), styles: vec![], reply_to: None }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 0,
+                text: "**x**".to_string(),
+                styles: vec![],
+                reply_to: None
+            })
+        );
     }
 
     #[test]
@@ -1223,7 +1783,93 @@ mod tests {
         app.handle_paste("line 1\nline 2");
         type_text(&mut app, "!");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "line 1\nline 2!".to_string(), styles: vec![], reply_to: None }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 0,
+                text: "line 1\nline 2!".to_string(),
+                styles: vec![],
+                reply_to: None
+            })
+        );
+    }
+
+    #[test]
+    fn ctrl_or_super_v_pastes_clipboard_image_placeholder() {
+        for (code, modifiers) in [
+            (KeyCode::Char('v'), KeyModifiers::CONTROL),
+            (
+                KeyCode::Char('V'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            (KeyCode::Char('v'), KeyModifiers::SUPER),
+        ] {
+            let mut app = opened();
+            assert_eq!(
+                app.handle_key(KeyEvent::new(code, modifiers)),
+                Some(Action::PasteImageFromClipboard)
+            );
+            let attachment = image_attachment();
+            app.handle_pasted_image(attachment.clone());
+            let send = app.handle_key(key(KeyCode::Enter));
+            assert_eq!(
+                send,
+                Some(Action::SendWithAttachments {
+                    discussion: 0,
+                    text: "".to_string(),
+                    attachments: vec![attachment],
+                    reply_to: None,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn open_targets_include_pasted_images() {
+        let mut app = opened();
+        let last = app.discussions[0].messages.len() - 1;
+        app.discussions[0].messages[last].attachments =
+            vec![image_attachment(), image_attachment()];
+        let targets = app.open_targets_for_selection();
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|target| target.ends_with(".png")));
+    }
+
+    #[test]
+    fn pasted_images_get_unique_labels() {
+        let mut app = opened();
+        app.handle_pasted_image(image_attachment());
+        app.handle_pasted_image(image_attachment());
+        assert!(screen(&mut app).contains("[image #1][image #2]"));
+        let Some(Action::SendWithAttachments {
+            discussion,
+            text,
+            attachments,
+            reply_to,
+        }) = app.handle_key(key(KeyCode::Enter))
+        else {
+            panic!("expected a send with attachments");
+        };
+        assert_eq!(text, "", "labels are not sent");
+        let mut message = Message::mine(1, text, reply_to, false);
+        message.attachments = attachments;
+        app.push_message(discussion, message);
+        app.handle_pasted_image(image_attachment());
+        assert!(screen(&mut app).contains("[image #3]"), "numbering goes on");
+    }
+
+    #[test]
+    fn opening_received_attachments_downloads_them() {
+        let mut app = opened();
+        let last = app.discussions[0].messages.len() - 1;
+        app.discussions[0].messages[last].remote_attachments = vec!["image/jpeg".to_string()];
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('o'))),
+            Some(Action::FetchAttachments {
+                discussion: 0,
+                msg: last
+            })
+        );
     }
 
     #[test]
@@ -1234,7 +1880,15 @@ mod tests {
         app.handle_key(key(KeyCode::Char('r')));
         type_text(&mut app, "ok");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "ok".to_string(), styles: vec![], reply_to: Some(last - 1) }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 0,
+                text: "ok".to_string(),
+                styles: vec![],
+                reply_to: Some(last - 1)
+            })
+        );
     }
 
     #[test]
@@ -1244,7 +1898,14 @@ mod tests {
         app.handle_key(key(KeyCode::Char('f')));
         app.handle_key(key(KeyCode::Down));
         let forward = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(forward, Some(Action::Forward { from: 0, msg: last, to: 1 }));
+        assert_eq!(
+            forward,
+            Some(Action::Forward {
+                from: 0,
+                msg: last,
+                to: 1
+            })
+        );
     }
 
     #[test]
@@ -1253,10 +1914,17 @@ mod tests {
         assert!(app.settings.notifications, "on by default");
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Char('p')));
-        assert_eq!(app.handle_key(key(KeyCode::Char(' '))), Some(Action::SettingsChanged));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char(' '))),
+            Some(Action::SettingsChanged)
+        );
         assert!(!app.settings.notifications);
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(1)), "back on the same discussion");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Action::Opened(1)),
+            "back on the same discussion"
+        );
     }
 
     /// The screen as text (escape sequences dropped), for rendering checks.
@@ -1287,9 +1955,16 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert!(screen(&mut app).contains("Dad ..."));
 
-        let message = Message { from_me: false, author: Some("dad".to_string()), ..Message::mine(1, "hi".to_string(), None, false) };
+        let message = Message {
+            from_me: false,
+            author: Some("dad".to_string()),
+            ..Message::mine(1, "hi".to_string(), None, false)
+        };
         app.push_message(1, message);
-        assert!(!screen(&mut app).contains("Dad ..."), "the message replaces the indicator");
+        assert!(
+            !screen(&mut app).contains("Dad ..."),
+            "the message replaces the indicator"
+        );
 
         app.set_typing(1, "mom", "Mom", true, now);
         app.set_typing(1, "mom", "Mom", false, now);
@@ -1310,7 +1985,10 @@ mod tests {
         // Pin Bob (index 2): it moves to the pinned list, and the selection follows it.
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.handle_key(key(KeyCode::Char('P'))), Some(Action::PinToggled(2)));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('P'))),
+            Some(Action::PinToggled(2))
+        );
         let text = screen(&mut app);
         assert!(text.find("Bob Dupont").unwrap() < text.find("Chats").unwrap());
         // Display order is now Alice, Bob, Family Group, Chloe.
@@ -1324,10 +2002,11 @@ mod tests {
         let pinned = |app: &mut App| {
             let text = screen(app);
             let end = text.find("Chats").unwrap();
-            let mut names: Vec<(usize, &str)> = ["Alice Martin", "Family Group", "Bob Dupont", "Chloe Renard"]
-                .into_iter()
-                .filter_map(|n| text[..end].find(n).map(|at| (at, n)))
-                .collect();
+            let mut names: Vec<(usize, &str)> =
+                ["Alice Martin", "Family Group", "Bob Dupont", "Chloe Renard"]
+                    .into_iter()
+                    .filter_map(|n| text[..end].find(n).map(|at| (at, n)))
+                    .collect();
             names.sort();
             names.into_iter().map(|(_, n)| n).collect::<Vec<_>>()
         };
@@ -1344,24 +2023,39 @@ mod tests {
 
     #[test]
     fn page_keys_jump_a_page_of_chats() {
-        let titles: Vec<Discussion> = (0..50).map(|i| Discussion::new(format!("Chat {i}"))).collect();
+        let titles: Vec<Discussion> = (0..50)
+            .map(|i| Discussion::new(format!("Chat {i}")))
+            .collect();
         let mut app = App::new(titles);
         let mut out = Vec::new();
         app.draw(&mut out, 80, 11).unwrap(); // 10 rows of list above the help line
         app.handle_key(key(KeyCode::PageDown));
         app.handle_key(key(KeyCode::PageDown));
         app.handle_key(key(KeyCode::PageUp));
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(10)));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Action::Opened(10))
+        );
 
-        let mut app = App::new((0..5).map(|i| Discussion::new(format!("Chat {i}"))).collect());
+        let mut app = App::new(
+            (0..5)
+                .map(|i| Discussion::new(format!("Chat {i}")))
+                .collect(),
+        );
         app.handle_key(key(KeyCode::PageDown));
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(4)), "clamped to the last chat");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Action::Opened(4)),
+            "clamped to the last chat"
+        );
     }
 
     #[test]
     fn page_keys_jump_a_page_of_messages() {
         let mut discussion = Discussion::new("Long".to_string());
-        discussion.messages = (0..40).map(|i| Message::mine(i, format!("message {i}"), None, false)).collect();
+        discussion.messages = (0..40)
+            .map(|i| Message::mine(i, format!("message {i}"), None, false))
+            .collect();
         let mut app = App::new(vec![discussion]);
         app.handle_key(key(KeyCode::Enter)); // last message (39) selected
         let mut out = Vec::new();
@@ -1371,9 +2065,19 @@ mod tests {
         app.handle_key(key(KeyCode::Char('r')));
         type_text(&mut app, "x");
         let send = app.handle_key(key(KeyCode::Enter));
-        let Some(Action::Send { reply_to: Some(selected), .. }) = send else { panic!("{send:?}") };
+        let Some(Action::Send {
+            reply_to: Some(selected),
+            ..
+        }) = send
+        else {
+            panic!("{send:?}")
+        };
         assert_eq!(selected, 39 - app.message_page);
-        assert!(app.message_page >= 5, "about a screen of messages, got {}", app.message_page);
+        assert!(
+            app.message_page >= 5,
+            "about a screen of messages, got {}",
+            app.message_page
+        );
     }
 
     #[test]
@@ -1381,22 +2085,49 @@ mod tests {
         let mut app = opened();
         let last = app.discussions[0].messages.len() - 1;
         app.handle_key(key(KeyCode::Char('e')));
-        assert!(screen(&mut app).contains("React: 1 \u{2764}\u{fe0f}  2 \u{1f44d}"), "quick reactions shown");
+        assert!(
+            screen(&mut app).contains("React: 1 \u{2764}\u{fe0f}  2 \u{1f44d}"),
+            "quick reactions shown"
+        );
         let react = app.handle_key(key(KeyCode::Char('2')));
         let thumbs_up = "\u{1f44d}".to_string();
-        assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji: thumbs_up.clone(), remove: false }));
+        assert_eq!(
+            react,
+            Some(Action::React {
+                discussion: 0,
+                msg: last,
+                emoji: thumbs_up.clone(),
+                remove: false
+            })
+        );
 
         app.handle_key(key(KeyCode::Char('e')));
         type_text(&mut app, "rocket");
         assert!(screen(&mut app).contains("\u{1f680} rocket"));
         let react = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji: "\u{1f680}".to_string(), remove: false }));
+        assert_eq!(
+            react,
+            Some(Action::React {
+                discussion: 0,
+                msg: last,
+                emoji: "\u{1f680}".to_string(),
+                remove: false
+            })
+        );
 
         // Our own reaction picked again: removed.
         app.discussions[0].messages[last].set_reaction("me", true, Some(&thumbs_up));
         app.handle_key(key(KeyCode::Char('e')));
         let react = app.handle_key(key(KeyCode::Char('2')));
-        assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji: thumbs_up, remove: true }));
+        assert_eq!(
+            react,
+            Some(Action::React {
+                discussion: 0,
+                msg: last,
+                emoji: thumbs_up,
+                remove: true
+            })
+        );
     }
 
     #[test]
@@ -1405,10 +2136,18 @@ mod tests {
         let last = app.discussions[0].messages.len() - 1;
         app.handle_key(key(KeyCode::Char('e')));
         app.handle_key(key(KeyCode::Right));
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), None, "no browsing before a shortcode is typed");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            None,
+            "no browsing before a shortcode is typed"
+        );
 
         let matches = reaction_matches("s");
-        assert!(matches.len() > 50, "every match, not a few: {}", matches.len());
+        assert!(
+            matches.len() > 50,
+            "every match, not a few: {}",
+            matches.len()
+        );
         type_text(&mut app, "s");
         assert!(screen(&mut app).contains(&format!("1/{}", matches.len())));
         for _ in 0..7 {
@@ -1417,14 +2156,30 @@ mod tests {
         app.handle_key(key(KeyCode::Left));
         assert!(screen(&mut app).contains(&format!("[{} {}]", matches[6].1, matches[6].0)));
         let react = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji: matches[6].1.to_string(), remove: false }));
+        assert_eq!(
+            react,
+            Some(Action::React {
+                discussion: 0,
+                msg: last,
+                emoji: matches[6].1.to_string(),
+                remove: false
+            })
+        );
 
         app.handle_key(key(KeyCode::Char('e')));
         type_text(&mut app, "s");
         app.handle_key(key(KeyCode::End));
         let react = app.handle_key(key(KeyCode::Enter));
         let emoji = matches[matches.len() - 1].1.to_string();
-        assert_eq!(react, Some(Action::React { discussion: 0, msg: last, emoji, remove: false }));
+        assert_eq!(
+            react,
+            Some(Action::React {
+                discussion: 0,
+                msg: last,
+                emoji,
+                remove: false
+            })
+        );
     }
 
     #[test]
@@ -1436,13 +2191,27 @@ mod tests {
 
         app.handle_key(key(KeyCode::Delete));
         assert!(screen(&mut app).contains("Delete this message for everyone?"));
-        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), None, "anything but y keeps it");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('n'))),
+            None,
+            "anything but y keeps it"
+        );
         app.handle_key(key(KeyCode::Delete));
-        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), Some(Action::Delete { discussion: 0, msg: last }));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('y'))),
+            Some(Action::Delete {
+                discussion: 0,
+                msg: last
+            })
+        );
 
         app.discussions[0].messages[last].mark_deleted();
         assert!(screen(&mut app).contains("This message was deleted"));
-        assert_eq!(app.handle_key(key(KeyCode::Delete)), None, "already deleted");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Delete)),
+            None,
+            "already deleted"
+        );
 
         // Old messages, and those of others, cannot be deleted.
         app.handle_key(key(KeyCode::Up));
@@ -1485,7 +2254,10 @@ mod tests {
     #[test]
     fn received_messages_mark_other_discussions_unread() {
         let mut app = opened();
-        let received = || Message { from_me: false, ..Message::mine(1, "hi".to_string(), None, false) };
+        let received = || Message {
+            from_me: false,
+            ..Message::mine(1, "hi".to_string(), None, false)
+        };
         app.push_message(0, received());
         app.push_message(2, received());
         app.push_message(3, Message::mine(2, "sent".to_string(), None, false));
@@ -1500,7 +2272,10 @@ mod tests {
         let mut app = app();
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.discussions[1].unread, 2);
-        assert!(screen(&mut app).contains("\u{2461} Family Group"), "count in a circle");
+        assert!(
+            screen(&mut app).contains("\u{2461} Family Group"),
+            "count in a circle"
+        );
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(1)));
         assert_eq!(app.discussions[1].unread, 0);
         // A line above the first new message, which is selected.
@@ -1510,7 +2285,15 @@ mod tests {
         app.handle_key(key(KeyCode::Char('r')));
         type_text(&mut app, "x");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 1, text: "x".to_string(), styles: vec![], reply_to: Some(1) }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 1,
+                text: "x".to_string(),
+                styles: vec![],
+                reply_to: Some(1)
+            })
+        );
     }
 
     #[test]
@@ -1521,6 +2304,14 @@ mod tests {
         type_text(&mut app, "x");
         let last = app.discussions[0].messages.len() - 1;
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "x".to_string(), styles: vec![], reply_to: Some(last) }));
+        assert_eq!(
+            send,
+            Some(Action::Send {
+                discussion: 0,
+                text: "x".to_string(),
+                styles: vec![],
+                reply_to: Some(last)
+            })
+        );
     }
 }

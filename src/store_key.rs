@@ -59,7 +59,9 @@ pub fn store_key(path: &str) -> Result<String, Box<dyn Error>> {
 
 /// Opens the store at `path` encrypted: gets its key, and first encrypts a plain store left
 /// by an earlier version.
-pub async fn open_encrypted(path: &str) -> Result<presage_store_sqlite::SqliteStore, Box<dyn Error>> {
+pub async fn open_encrypted(
+    path: &str,
+) -> Result<presage_store_sqlite::SqliteStore, Box<dyn Error>> {
     restrict_new_files();
     let key = store_key(path)?;
     if store_state(path)? == StoreState::Plain {
@@ -116,11 +118,22 @@ pub async fn encrypt_store(path: &str, key: &str) -> Result<(), Box<dyn Error>> 
     let _ = std::fs::remove_file(&encrypted);
 
     // Creating files is needed for the attached encrypted one.
-    let mut conn = SqliteConnectOptions::from_str(path)?.create_if_missing(true).connect().await?;
+    let mut conn = SqliteConnectOptions::from_str(path)?
+        .create_if_missing(true)
+        .connect()
+        .await?;
     // The export reads through this connection, so it includes what is still in the WAL.
-    sqlx::query("ATTACH DATABASE ?1 AS encrypted KEY ?2").bind(&encrypted).bind(key).execute(&mut conn).await?;
-    sqlx::query("SELECT sqlcipher_export('encrypted')").execute(&mut conn).await?;
-    sqlx::query("DETACH DATABASE encrypted").execute(&mut conn).await?;
+    sqlx::query("ATTACH DATABASE ?1 AS encrypted KEY ?2")
+        .bind(&encrypted)
+        .bind(key)
+        .execute(&mut conn)
+        .await?;
+    sqlx::query("SELECT sqlcipher_export('encrypted')")
+        .execute(&mut conn)
+        .await?;
+    sqlx::query("DETACH DATABASE encrypted")
+        .execute(&mut conn)
+        .await?;
     use sqlx::Connection;
     conn.close().await?;
 
@@ -152,17 +165,32 @@ mod tests {
 
         encrypt_store(path, "secret").await.unwrap();
         assert_eq!(store_state(path).unwrap(), StoreState::Encrypted);
-        assert!(!std::fs::read(path).unwrap().windows(9).any(|w| w == b"_sqlx_mig"), "no clear text left");
+        assert!(
+            !std::fs::read(path)
+                .unwrap()
+                .windows(9)
+                .any(|w| w == b"_sqlx_mig"),
+            "no clear text left"
+        );
 
         let store = signal::open_store(path, Some("secret")).await.unwrap();
-        assert!(matches!(signal::load_registered(store).await, Err(presage::Error::NotYetRegisteredError)));
-        assert!(signal::open_store(path, Some("wrong")).await.is_err(), "wrong key");
+        assert!(matches!(
+            signal::load_registered(store).await,
+            Err(presage::Error::NotYetRegisteredError)
+        ));
+        assert!(
+            signal::open_store(path, Some("wrong")).await.is_err(),
+            "wrong key"
+        );
     }
 
     #[test]
     fn missing_store() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("none.db3");
-        assert_eq!(store_state(path.to_str().unwrap()).unwrap(), StoreState::Missing);
+        assert_eq!(
+            store_state(path.to_str().unwrap()).unwrap(),
+            StoreState::Missing
+        );
     }
 }

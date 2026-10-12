@@ -18,10 +18,64 @@ pub struct Message {
     pub deleted: bool,
     /// Formatting of `text`.
     pub styles: Vec<Styled>,
+    /// Attachments available locally: sent from this client, or downloaded.
+    pub attachments: Vec<Attachment>,
+    /// Content types of the received attachments not downloaded yet (fetched on open).
+    pub remote_attachments: Vec<String>,
+    /// Previews of the links of `text`, as the sender's app made them.
+    pub previews: Vec<LinkPreview>,
+    /// Downloading its attachments failed (expired on the servers…).
+    pub download_failed: bool,
+}
+
+/// Preview of a link: title, description and image of the page.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: String,
+    pub description: String,
+    /// Its image, once downloaded.
+    pub image: Option<Attachment>,
+    /// It has an image not downloaded yet.
+    pub remote_image: bool,
 }
 
 /// How long after sending a message can be deleted for everyone (Signal's default limit).
 pub const DELETE_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// File or image data attached to a Signal message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    pub content_type: String,
+    pub file_name: Option<String>,
+    pub bytes: Vec<u8>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+impl Attachment {
+    /// The image in the system clipboard, as PNG.
+    pub fn from_clipboard() -> Option<Self> {
+        use image::ImageEncoder;
+        let image = arboard::Clipboard::new().ok()?.get_image().ok()?;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                &image.bytes,
+                image.width as u32,
+                image.height as u32,
+                image::ColorType::Rgba8.into(),
+            )
+            .ok()?;
+        Some(Attachment {
+            content_type: "image/png".to_string(),
+            file_name: Some("clipboard.png".to_string()),
+            bytes: png,
+            width: Some(image.width as u32),
+            height: Some(image.height as u32),
+        })
+    }
+}
 
 /// Text formatting, as Signal sends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +134,101 @@ impl Message {
             reactions: Vec::new(),
             deleted: false,
             styles: Vec::new(),
+            attachments: Vec::new(),
+            remote_attachments: Vec::new(),
+            previews: Vec::new(),
+            download_failed: false,
         }
+    }
+
+    /// Number of its attachments, downloaded or not.
+    pub fn attachment_count(&self) -> usize {
+        self.attachments.len() + self.remote_attachments.len()
+    }
+
+    /// Content types of its attachments, downloaded or not.
+    fn attachment_types(&self) -> impl Iterator<Item = &str> {
+        self.attachments
+            .iter()
+            .map(|a| a.content_type.as_str())
+            .chain(self.remote_attachments.iter().map(String::as_str))
+    }
+
+    /// Whether it has attachments or preview images not downloaded yet.
+    pub fn needs_download(&self) -> bool {
+        !self.remote_attachments.is_empty() || self.previews.iter().any(|p| p.remote_image)
+    }
+
+    /// Whether its downloads are only images, worth fetching for the thumbnails.
+    pub fn images_only(&self) -> bool {
+        self.remote_attachments
+            .iter()
+            .all(|t| t.starts_with("image/"))
+    }
+
+    /// Stores what was downloaded: its attachments and the images of its previews.
+    pub fn set_downloaded(
+        &mut self,
+        attachments: Vec<Attachment>,
+        images: Vec<Option<Attachment>>,
+    ) {
+        self.attachments = attachments;
+        self.remote_attachments.clear();
+        for (preview, image) in self.previews.iter_mut().zip(images) {
+            preview.image = image;
+            preview.remote_image = false;
+        }
+        self.download_failed = false;
+    }
+
+    /// Its text, with a label per attachment in front ("[image #3]") when numbered from
+    /// `first` in the discussion, and the styles moved to match.
+    pub fn display(&self, first: Option<usize>) -> (String, Vec<Styled>) {
+        if self.deleted {
+            return ("This message was deleted".to_string(), Vec::new());
+        }
+        let Some(first) = first else {
+            return (self.text.clone(), self.styles.clone());
+        };
+        let labels: Vec<String> = self
+            .attachment_types()
+            .enumerate()
+            .map(|(i, content_type)| attachment_label(content_type, Some(first + i)))
+            .collect();
+        self.prefixed(labels)
+    }
+
+    /// Its text in one line, for quotes and notifications: "[image] look".
+    pub fn summary(&self) -> String {
+        if self.deleted {
+            return "This message was deleted".to_string();
+        }
+        let labels = self
+            .attachment_types()
+            .map(|t| attachment_label(t, None))
+            .collect();
+        self.prefixed(labels).0
+    }
+
+    /// Its text after `labels`, with the styles moved to match.
+    fn prefixed(&self, mut labels: Vec<String>) -> (String, Vec<Styled>) {
+        if labels.is_empty() {
+            return (self.text.clone(), self.styles.clone());
+        }
+        if !self.text.is_empty() {
+            labels.push(String::new());
+        }
+        let prefix = labels.join(" ");
+        let styles = self
+            .styles
+            .iter()
+            .map(|s| Styled {
+                start: s.start + prefix.len(),
+                end: s.end + prefix.len(),
+                style: s.style,
+            })
+            .collect();
+        (prefix + &self.text, styles)
     }
 
     /// Whether we can delete it for everyone at `now_ms`: ours, sent less than 24 h ago.
@@ -94,33 +242,50 @@ impl Message {
         self.text.clear();
         self.reactions.clear();
         self.styles.clear();
+        self.previews.clear();
     }
 
     /// Sets the reaction of `author` (replacing theirs), or removes it with `None`.
     pub fn set_reaction(&mut self, author: &str, mine: bool, emoji: Option<&str>) {
         self.reactions.retain(|r| r.author != author);
         if let Some(emoji) = emoji {
-            self.reactions.push(Reaction { author: author.to_string(), emoji: emoji.to_string(), mine });
+            self.reactions.push(Reaction {
+                author: author.to_string(),
+                emoji: emoji.to_string(),
+                mine,
+            });
         }
     }
 
     /// Our own reaction, if any.
     pub fn my_reaction(&self) -> Option<&str> {
-        self.reactions.iter().find(|r| r.mine).map(|r| r.emoji.as_str())
+        self.reactions
+            .iter()
+            .find(|r| r.mine)
+            .map(|r| r.emoji.as_str())
     }
 
     /// The reactions grouped by emoji, in order of appearance: `❤️ 2  👍` (count when > 1).
     pub fn reaction_summary(&self) -> String {
         let mut counts: Vec<(&str, usize)> = Vec::new();
         for reaction in &self.reactions {
-            match counts.iter_mut().find(|(emoji, _)| *emoji == reaction.emoji) {
+            match counts
+                .iter_mut()
+                .find(|(emoji, _)| *emoji == reaction.emoji)
+            {
                 Some((_, count)) => *count += 1,
                 None => counts.push((&reaction.emoji, 1)),
             }
         }
         let parts: Vec<String> = counts
             .into_iter()
-            .map(|(emoji, count)| if count > 1 { format!("{emoji} {count}") } else { emoji.to_string() })
+            .map(|(emoji, count)| {
+                if count > 1 {
+                    format!("{emoji} {count}")
+                } else {
+                    emoji.to_string()
+                }
+            })
             .collect();
         parts.join("  ")
     }
@@ -155,12 +320,44 @@ impl Discussion {
     }
 
     pub fn new(title: String) -> Self {
-        Discussion { title, messages: Vec::new(), unread: 0, pinned: None }
+        Discussion {
+            title,
+            messages: Vec::new(),
+            unread: 0,
+            pinned: None,
+        }
+    }
+
+    /// Number of the first attachment of message `idx`: attachments are numbered from 1 in
+    /// the order they appear in the discussion.
+    pub fn first_attachment(&self, idx: usize) -> usize {
+        1 + self.messages[..idx]
+            .iter()
+            .map(Message::attachment_count)
+            .sum::<usize>()
+    }
+
+    /// Number the next attachment will get.
+    pub fn next_attachment(&self) -> usize {
+        self.first_attachment(self.messages.len())
     }
 
     /// Index of the message with this Signal id.
     pub fn position_of(&self, id: u64) -> Option<usize> {
         self.messages.iter().rposition(|m| m.id == id)
+    }
+}
+
+/// Label of an attachment: "[image]", "[video]"…, with its `number` in the discussion
+/// when given ("[image #3]").
+pub fn attachment_label(content_type: &str, number: Option<usize>) -> String {
+    let kind = match content_type.split('/').next().unwrap_or_default() {
+        kind @ ("image" | "video" | "audio") => kind,
+        _ => "file",
+    };
+    match number {
+        Some(number) => format!("[{kind} #{number}]"),
+        None => format!("[{kind}]"),
     }
 }
 
@@ -191,6 +388,10 @@ fn msg(from_me: bool, sender_name: &str, text: &str, ts: &str) -> Message {
         reactions: Vec::new(),
         deleted: false,
         styles: Vec::new(),
+        attachments: Vec::new(),
+        remote_attachments: Vec::new(),
+        previews: Vec::new(),
+        download_failed: false,
     }
 }
 
@@ -267,7 +468,7 @@ pub fn mock_discussions() -> Vec<Discussion> {
 
 #[cfg(test)]
 mod tests {
-    use super::links;
+    use super::*;
 
     #[test]
     fn extracts_links() {
@@ -276,5 +477,32 @@ mod tests {
             vec!["https://a.example/x", "http://b.example/y"]
         );
         assert!(links("no link here").is_empty());
+    }
+
+    #[test]
+    fn attachments_are_labelled_in_discussion_order() {
+        let mut discussion = Discussion::new("Alice".to_string());
+        let mut photo = Message::mine(1, String::new(), None, false);
+        photo.remote_attachments = vec!["image/jpeg".to_string(), "application/pdf".to_string()];
+        let mut captioned = Message::mine(2, "look".to_string(), None, false);
+        captioned.remote_attachments = vec!["image/png".to_string()];
+        captioned.styles = vec![Styled {
+            start: 0,
+            end: 4,
+            style: Style::Bold,
+        }];
+        discussion.messages = vec![photo, captioned];
+
+        let first = discussion.first_attachment(0);
+        assert_eq!(
+            discussion.messages[0].display(Some(first)).0,
+            "[image #1] [file #2]"
+        );
+        assert_eq!(discussion.messages[0].summary(), "[image] [file]");
+        assert_eq!(discussion.messages[1].display(None).0, "look");
+        let (text, styles) = discussion.messages[1].display(Some(discussion.first_attachment(1)));
+        assert_eq!(text, "[image #3] look");
+        assert_eq!(&text[styles[0].start..styles[0].end], "look");
+        assert_eq!(discussion.next_attachment(), 4);
     }
 }

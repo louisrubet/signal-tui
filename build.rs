@@ -10,11 +10,7 @@ fn git_output(args: &[&str]) -> Option<String> {
 
     let value = String::from_utf8(output.stdout).ok()?;
     let value = value.trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn git_path(path: &str) -> Option<String> {

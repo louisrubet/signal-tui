@@ -27,13 +27,21 @@ struct Undo {
 }
 
 /// Formatting markers, longest first so that `**` is not taken for two `*`.
-const MARKERS: [(&str, Style); 3] = [("**", Style::Bold), ("*", Style::Italic), ("~", Style::Strikethrough)];
+const MARKERS: [(&str, Style); 3] = [
+    ("**", Style::Bold),
+    ("*", Style::Italic),
+    ("~", Style::Strikethrough),
+];
 
 impl Editor {
     /// An editor holding `text`, cursor at the end.
     pub fn new(text: &str) -> Self {
         let text = normalize_newlines(text);
-        Editor { cursor: text.len(), text, ..Default::default() }
+        Editor {
+            cursor: text.len(),
+            text,
+            ..Default::default()
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -50,12 +58,24 @@ impl Editor {
         let (at, removed, added) = (range.start, range.len(), with.len());
         self.text.replace_range(range, with);
         // Removal: positions inside the removed part move to its start.
-        let removal = |p: usize| if p <= at { p } else if p < at + removed { at } else { p - removed };
+        let removal = |p: usize| {
+            if p <= at {
+                p
+            } else if p < at + removed {
+                at
+            } else {
+                p - removed
+            }
+        };
         for styled in &mut self.styles {
             let (start, end) = (removal(styled.start), removal(styled.end));
             // Insertion at `at`: a range starting there moves, one ending there does not grow.
             styled.start = if start >= at { start + added } else { start };
-            styled.end = if end > at || (end == at && start >= at) { end + added } else { end };
+            styled.end = if end > at || (end == at && start >= at) {
+                end + added
+            } else {
+                end
+            };
         }
         self.styles.retain(|s| s.start < s.end);
     }
@@ -63,7 +83,9 @@ impl Editor {
     /// Undoes the formatting just applied (the markers come back as plain text), if nothing
     /// changed since. Returns whether it did.
     pub fn undo_format(&mut self) -> bool {
-        let Some(undo) = self.undo.take() else { return false };
+        let Some(undo) = self.undo.take() else {
+            return false;
+        };
         if undo.after != (self.text.clone(), self.cursor) {
             return false;
         }
@@ -75,15 +97,22 @@ impl Editor {
     fn format(&mut self) {
         let before = &self.text[..self.cursor];
         for (marker, style) in MARKERS {
-            let Some(body) = before.strip_suffix(marker) else { continue };
+            let Some(body) = before.strip_suffix(marker) else {
+                continue;
+            };
             // A single `*` right after another one is the end of a `**`.
             if marker == "*" && body.ends_with('*') {
                 continue;
             }
-            let Some(open) = body.rfind(marker) else { continue };
+            let Some(open) = body.rfind(marker) else {
+                continue;
+            };
             let content = &body[open + marker.len()..];
             // The opening marker starts a word: not inside one (`a*b*`), nor part of `**`.
-            let starts_word = body[..open].chars().next_back().is_none_or(|c| !c.is_alphanumeric() && c != '*');
+            let starts_word = body[..open]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '*');
             let valid = !content.is_empty()
                 && !content.contains('\n')
                 && !content.starts_with(char::is_whitespace)
@@ -97,10 +126,19 @@ impl Editor {
             let content_len = content.len();
             self.splice(self.cursor - marker.len()..self.cursor, "");
             self.splice(open..open + marker.len(), "");
-            self.styles.push(Styled { start: open, end: open + content_len, style });
+            self.styles.push(Styled {
+                start: open,
+                end: open + content_len,
+                style,
+            });
             self.cursor = open + content_len;
             let after = (self.text.clone(), self.cursor);
-            self.undo = Some(Undo { text: undo.0, cursor: undo.1, styles: undo.2, after });
+            self.undo = Some(Undo {
+                text: undo.0,
+                cursor: undo.1,
+                styles: undo.2,
+                after,
+            });
             return;
         }
     }
@@ -144,10 +182,15 @@ impl Editor {
 
     /// Replaces the `:shortcode:` that ends at the cursor by its emoji, if it is known.
     fn expand_shortcode(&mut self) {
-        let Some(body) = self.text[..self.cursor].strip_suffix(':') else { return };
+        let Some(body) = self.text[..self.cursor].strip_suffix(':') else {
+            return;
+        };
         let Some(start) = body.rfind(':') else { return };
         let shortcode = &body[start + 1..];
-        let valid = !shortcode.is_empty() && shortcode.chars().all(|c| c.is_ascii_alphanumeric() || "_+-".contains(c));
+        let valid = !shortcode.is_empty()
+            && shortcode
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_+-".contains(c));
         if !valid {
             return;
         }
@@ -196,7 +239,9 @@ impl Editor {
         let mut rest = self.text[self.cursor..].char_indices().peekable();
         while rest.next_if(|(_, c)| !is_word(*c)).is_some() {}
         while rest.next_if(|(_, c)| is_word(*c)).is_some() {}
-        self.cursor += rest.peek().map_or(self.text.len() - self.cursor, |(at, _)| *at);
+        self.cursor += rest
+            .peek()
+            .map_or(self.text.len() - self.cursor, |(at, _)| *at);
     }
 
     pub fn home(&mut self) {
@@ -230,11 +275,17 @@ impl Editor {
     }
 
     fn prev_boundary(&self) -> Option<usize> {
-        self.text[..self.cursor].char_indices().next_back().map(|(i, _)| i)
+        self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
     }
 
     fn next_boundary(&self) -> Option<usize> {
-        self.text[self.cursor..].chars().next().map(|c| self.cursor + c.len_utf8())
+        self.text[self.cursor..]
+            .chars()
+            .next()
+            .map(|c| self.cursor + c.len_utf8())
     }
 
     fn line_start(&self, at: usize) -> usize {
@@ -242,7 +293,9 @@ impl Editor {
     }
 
     fn line_end(&self, at: usize) -> usize {
-        self.text[at..].find('\n').map_or(self.text.len(), |i| at + i)
+        self.text[at..]
+            .find('\n')
+            .map_or(self.text.len(), |i| at + i)
     }
 
     /// Byte index of column `col` in the line starting at `start`, clamped to its end.
@@ -282,7 +335,14 @@ mod tests {
     fn markers_format_when_closed() {
         let e = typed("a **b** *c* ~d~ e");
         assert_eq!(e.text(), "a b c d e");
-        assert_eq!(e.styles(), [styled(2, 3, Style::Bold), styled(4, 5, Style::Italic), styled(6, 7, Style::Strikethrough)]);
+        assert_eq!(
+            e.styles(),
+            [
+                styled(2, 3, Style::Bold),
+                styled(4, 5, Style::Italic),
+                styled(6, 7, Style::Strikethrough)
+            ]
+        );
     }
 
     #[test]
@@ -312,15 +372,27 @@ mod tests {
         let mut e = typed("**bold** x");
         e.home();
         e.insert(">> ");
-        assert_eq!(e.styles(), [styled(3, 7, Style::Bold)], "moved by text before");
+        assert_eq!(
+            e.styles(),
+            [styled(3, 7, Style::Bold)],
+            "moved by text before"
+        );
         e.right();
         e.right();
         e.insert("o");
         assert_eq!(e.text(), ">> booold x".replacen("oo", "o", 1));
-        assert_eq!(e.styles(), [styled(3, 8, Style::Bold)], "grows with text inside");
+        assert_eq!(
+            e.styles(),
+            [styled(3, 8, Style::Bold)],
+            "grows with text inside"
+        );
         e.end();
         e.insert("!");
-        assert_eq!(e.styles(), [styled(3, 8, Style::Bold)], "not with text after");
+        assert_eq!(
+            e.styles(),
+            [styled(3, 8, Style::Bold)],
+            "not with text after"
+        );
     }
 
     #[test]
@@ -378,7 +450,11 @@ mod tests {
         e.word_left();
         assert_eq!(e.cursor_line_col(), (1, 0), "start of été, over the space");
         e.word_left();
-        assert_eq!(e.cursor_line_col(), (0, 12), "start of monde, over the line break");
+        assert_eq!(
+            e.cursor_line_col(),
+            (0, 12),
+            "start of monde, over the line break"
+        );
         e.word_left();
         e.word_left();
         assert_eq!(e.cursor_line_col(), (0, 0), "over the comma");

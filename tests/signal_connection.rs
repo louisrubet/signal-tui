@@ -18,7 +18,9 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 async fn provisioning_link() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("store.db3");
-    let store = signal::open_store(db.to_str().unwrap(), None).await.unwrap();
+    let store = signal::open_store(db.to_str().unwrap(), None)
+        .await
+        .unwrap();
 
     let (tx, rx) = oneshot::channel();
     let linking = Box::pin(signal::link_device(store, "signal-tui test", tx));
@@ -27,7 +29,9 @@ async fn provisioning_link() {
     // Nobody scans it, so `linking` is dropped (cancelled) once we have it.
     let url = match tokio::time::timeout(TIMEOUT, future::select(linking, rx)).await {
         Err(_) => panic!("no provisioning link from the Signal servers after {TIMEOUT:?}"),
-        Ok(Either::Left((result, _))) => panic!("linking ended before the link was sent: {:?}", result.err()),
+        Ok(Either::Left((result, _))) => {
+            panic!("linking ended before the link was sent: {:?}", result.err())
+        }
         Ok(Either::Right((url, _))) => url.expect("provisioning link channel closed"),
     };
 
@@ -35,6 +39,8 @@ async fn provisioning_link() {
     assert_eq!(url.host_str(), Some("linkdevice"));
     let params: Vec<String> = url.query_pairs().map(|(k, _)| k.into_owned()).collect();
     assert!(params.iter().any(|k| k == "uuid"), "missing uuid in {url}");
-    assert!(params.iter().any(|k| k == "pub_key"), "missing pub_key in {url}");
+    assert!(
+        params.iter().any(|k| k == "pub_key"),
+        "missing pub_key in {url}"
+    );
 }
-

@@ -15,16 +15,17 @@ use futures::{StreamExt, future};
 use presage::Manager;
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::{Content, ContentBody};
+use presage::libsignal_service::prelude::{MessageSenderError, Uuid};
 use presage::libsignal_service::protocol::ServiceId;
+use presage::libsignal_service::sender::AttachmentSpec;
+use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
-use presage::libsignal_service::prelude::Uuid;
-use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
-use presage::proto::data_message::{Delete, Quote, Reaction};
-use presage::proto::typing_message::Action as TypingAction;
-use presage::proto::sync_message::{Content as SyncContent, Sent};
 use presage::proto::body_range::{AssociatedValue, Style as BodyStyle};
+use presage::proto::data_message::{Delete, Quote, Reaction};
+use presage::proto::sync_message::{Content as SyncContent, Sent};
+use presage::proto::typing_message::Action as TypingAction;
 use presage::proto::{BodyRange, DataMessage, GroupContextV2, SyncMessage};
 use presage::store::ContentsStore;
 pub use presage::store::Thread;
@@ -32,7 +33,7 @@ use presage_store_sqlite::{SqliteStore, SqliteStoreError};
 use tokio::time::Instant;
 use url::Url;
 
-use crate::data::{Discussion, Message, Style, Styled};
+use crate::data::{Attachment, DELETE_MAX_AGE_MS, Discussion, LinkPreview, Message, Style, Styled};
 
 pub type SignalError = presage::Error<SqliteStoreError>;
 pub type SignalManager = Manager<SqliteStore, Registered>;
@@ -46,20 +47,28 @@ pub fn default_store_path() -> std::io::Result<PathBuf> {
             let data_dir = std::env::var_os("XDG_DATA_HOME")
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute())
-                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+                })
                 .ok_or_else(|| std::io::Error::other("neither XDG_DATA_HOME nor HOME is set"))?;
             data_dir.join("signal-tui").join("signal-tui.db3")
         }
     };
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         // The store holds the device keys: keep the directory private.
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
     }
     Ok(path)
 }
 
 /// Opens (creating it if needed) the local SQLCipher store holding the device keys.
-pub async fn open_store(path: &str, passphrase: Option<&str>) -> Result<SqliteStore, SqliteStoreError> {
+pub async fn open_store(
+    path: &str,
+    passphrase: Option<&str>,
+) -> Result<SqliteStore, SqliteStoreError> {
     SqliteStore::open_with_passphrase(path, passphrase, OnNewIdentity::Trust).await
 }
 
@@ -69,7 +78,11 @@ pub async fn open_store(path: &str, passphrase: Option<&str>) -> Result<SqliteSt
 /// The device stays listed on the phone (Settings > Linked devices) until it is removed there.
 pub fn remove_store(path: &str) -> std::io::Result<()> {
     crate::store_key::forget_store_key(path);
-    for file in [path.to_string(), format!("{path}-wal"), format!("{path}-shm")] {
+    for file in [
+        path.to_string(),
+        format!("{path}-wal"),
+        format!("{path}-shm"),
+    ] {
         match std::fs::remove_file(&file) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
             _ => {}
@@ -88,12 +101,19 @@ pub async fn link_device(
     device_name: &str,
     provisioning_link: oneshot::Sender<Url>,
 ) -> Result<Manager<SqliteStore, Registered>, SignalError> {
-    Manager::link_secondary_device(store, SignalServers::Production, device_name.to_string(), provisioning_link)
-        .await
+    Manager::link_secondary_device(
+        store,
+        SignalServers::Production,
+        device_name.to_string(),
+        provisioning_link,
+    )
+    .await
 }
 
 /// Loads an already linked device from the store.
-pub async fn load_registered(store: SqliteStore) -> Result<Manager<SqliteStore, Registered>, SignalError> {
+pub async fn load_registered(
+    store: SqliteStore,
+) -> Result<Manager<SqliteStore, Registered>, SignalError> {
     Manager::load_registered(store).await
 }
 
@@ -162,7 +182,9 @@ pub async fn sync(
                 Some(deadline) => deadline.saturating_duration_since(Instant::now()),
                 None => IDLE_TIMEOUT,
             };
-            let Ok(Some(received)) = tokio::time::timeout(wait, messages.next()).await else { break };
+            let Ok(Some(received)) = tokio::time::timeout(wait, messages.next()).await else {
+                break;
+            };
             match received {
                 Received::QueueEmpty => {
                     contacts_deadline.get_or_insert(Instant::now() + contacts_timeout);
@@ -201,7 +223,11 @@ pub async fn conversations(
     }
     for contact in store.contacts().await?.flatten() {
         let position = Some(contact.inbox_position).filter(|&p| p > 0);
-        threads.push((Thread::Contact(ServiceId::Aci(contact.uuid.into())), position, position.is_some()));
+        threads.push((
+            Thread::Contact(ServiceId::Aci(contact.uuid.into())),
+            position,
+            position.is_some(),
+        ));
     }
     for thread in extra {
         match threads.iter_mut().find(|(t, ..)| *t == thread) {
@@ -228,7 +254,13 @@ pub async fn conversations(
         if !open && message_count == 0 {
             continue;
         }
-        conversations.push(Conversation { thread, title, inbox_position, message_count, last_message });
+        conversations.push(Conversation {
+            thread,
+            title,
+            inbox_position,
+            message_count,
+            last_message,
+        });
     }
 
     conversations.sort_by(|a, b| {
@@ -249,7 +281,11 @@ fn data_message(content: &Content) -> Option<(&DataMessage, bool)> {
     match &content.body {
         ContentBody::DataMessage(message) => Some((message, false)),
         ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(SyncContent::Sent(Sent { message: Some(message), .. })),
+            content:
+                Some(SyncContent::Sent(Sent {
+                    message: Some(message),
+                    ..
+                })),
             ..
         }) => Some((message, true)),
         _ => None,
@@ -258,7 +294,10 @@ fn data_message(content: &Content) -> Option<(&DataMessage, bool)> {
 
 /// Display name of a conversation: group title, contact name or phone number, and
 /// "Note to Self" for the conversation with our own account.
-pub async fn thread_title(manager: &SignalManager, thread: &Thread) -> Result<String, SqliteStoreError> {
+pub async fn thread_title(
+    manager: &SignalManager,
+    thread: &Thread,
+) -> Result<String, SqliteStoreError> {
     let store = manager.store();
     let title = match thread {
         Thread::Contact(id) if id.raw_uuid() == manager.registration_data().service_ids.aci => {
@@ -305,7 +344,9 @@ pub struct ReactionUpdate {
 impl ReactionUpdate {
     /// Applies it to the message of `discussion` it targets, if that message is there.
     pub fn apply(&self, discussion: &mut Discussion) -> bool {
-        let Some(idx) = discussion.position_of(self.target_id) else { return false };
+        let Some(idx) = discussion.position_of(self.target_id) else {
+            return false;
+        };
         discussion.messages[idx].set_reaction(&self.author, self.mine, self.emoji.as_deref());
         true
     }
@@ -336,7 +377,11 @@ impl Directory {
             let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
             groups.insert(params.get_group_identifier(), master_key);
         }
-        Ok(Directory { own_aci: manager.registration_data().service_ids.aci, names, groups })
+        Ok(Directory {
+            own_aci: manager.registration_data().service_ids.aci,
+            names,
+            groups,
+        })
     }
 
     /// Contact name, or the start of the ACI for strangers.
@@ -358,7 +403,11 @@ impl Directory {
             target_id: reaction.target_sent_timestamp?,
             author: author.to_string(),
             mine,
-            emoji: if reaction.remove() { None } else { reaction.emoji.clone() },
+            emoji: if reaction.remove() {
+                None
+            } else {
+                reaction.emoji.clone()
+            },
         })
     }
 
@@ -374,7 +423,9 @@ impl Directory {
 
     /// The typing notification in `content`, if any (ours from other devices are ignored).
     pub fn typing(&self, content: &Content) -> Option<Typing> {
-        let ContentBody::TypingMessage(typing) = &content.body else { return None };
+        let ContentBody::TypingMessage(typing) = &content.body else {
+            return None;
+        };
         let sender = content.metadata.sender.raw_uuid();
         if sender == self.own_aci {
             return None;
@@ -391,14 +442,20 @@ impl Directory {
         })
     }
 
-    /// The text message in `content`, with the id of the message it quotes.
-    /// `None` for anything that is not a text message (receipts, typing, reactions…).
+    /// The text or attachment message in `content`, with the id of the message it quotes.
+    /// `None` for anything else (receipts, typing, reactions…). Attachments are not
+    /// downloaded: see [`download_attachments`].
     pub fn to_message(&self, content: &Content) -> Option<(Message, Option<u64>)> {
         let (data, sent_elsewhere) = data_message(content)?;
-        let text = data.body.clone()?;
+        if data.body.is_none() && data.attachments.is_empty() {
+            return None;
+        }
+        let text = data.body.clone().unwrap_or_default();
         let sender = content.metadata.sender.raw_uuid();
         let from_me = sent_elsewhere || sender == self.own_aci;
-        let id = data.timestamp.unwrap_or_else(|| content.metadata.client_timestamp.timestamp_millis() as u64);
+        let id = data
+            .timestamp
+            .unwrap_or_else(|| content.metadata.client_timestamp.timestamp_millis() as u64);
         let sender_name = self.name_of(&sender);
         let styles = from_body_ranges(&text, &data.body_ranges);
         let message = Message {
@@ -407,12 +464,34 @@ impl Directory {
             from_me,
             sender_name,
             text,
-            timestamp: content.metadata.client_timestamp.with_timezone(&Local).naive_local(),
+            timestamp: content
+                .metadata
+                .client_timestamp
+                .with_timezone(&Local)
+                .naive_local(),
             reply_to: None,
             forwarded: false,
             reactions: Vec::new(),
             deleted: false,
             styles,
+            attachments: Vec::new(),
+            remote_attachments: data
+                .attachments
+                .iter()
+                .map(|p| p.content_type().to_string())
+                .collect(),
+            previews: data
+                .preview
+                .iter()
+                .map(|p| LinkPreview {
+                    url: p.url.clone().unwrap_or_default(),
+                    title: p.title.clone().unwrap_or_default(),
+                    description: p.description.clone().unwrap_or_default(),
+                    image: None,
+                    remote_image: p.image.is_some(),
+                })
+                .collect(),
+            download_failed: false,
         };
         Some((message, data.quote.as_ref().and_then(|q| q.id)))
     }
@@ -420,7 +499,9 @@ impl Directory {
     /// Appends the message in `content` (if any) to `discussion`, resolving its quote.
     /// Returns whether a message was added.
     pub fn append(&self, discussion: &mut Discussion, content: &Content) -> bool {
-        let Some(message) = self.resolve(discussion, content) else { return false };
+        let Some(message) = self.resolve(discussion, content) else {
+            return false;
+        };
         discussion.messages.push(message);
         true
     }
@@ -431,6 +512,75 @@ impl Directory {
         message.reply_to = quote.and_then(|id| discussion.position_of(id));
         Some(message)
     }
+}
+
+/// Downloads the attachments of message `id` (received, not downloaded yet) from the
+/// Signal servers, finding it in the store of `thread`.
+pub async fn download_attachments(
+    manager: &SignalManager,
+    thread: &Thread,
+    id: u64,
+) -> Result<Downloaded, SignalError> {
+    let store = manager.store();
+    // Stored by envelope timestamp: for our messages sent from another device, it differs
+    // from the message id (a little later).
+    let content = match store.message(thread, id).await? {
+        Some(content) => Some(content),
+        None => store
+            .messages(thread, id..=id + DELETE_MAX_AGE_MS)
+            .await?
+            .flatten()
+            .find(|c| data_message(c).and_then(|(data, _)| data.timestamp) == Some(id)),
+    };
+    match content {
+        Some(content) => download_content_attachments(manager, &content).await,
+        None => Ok(Default::default()),
+    }
+}
+
+/// What [`download_attachments`] brings: the attachments of a message, and the images of
+/// its link previews (`None` for none, or when it failed).
+pub type Downloaded = (Vec<Attachment>, Vec<Option<Attachment>>);
+
+/// Downloads the attachments and preview images of the message in `content` from the
+/// Signal servers.
+pub async fn download_content_attachments(
+    manager: &SignalManager,
+    content: &Content,
+) -> Result<Downloaded, SignalError> {
+    let Some((data, _)) = data_message(content) else {
+        return Ok(Default::default());
+    };
+    let mut attachments = Vec::new();
+    for pointer in &data.attachments {
+        attachments.push(Attachment {
+            content_type: pointer.content_type().to_string(),
+            file_name: pointer.file_name.clone(),
+            bytes: manager.get_attachment(pointer).await?,
+            width: pointer.width,
+            height: pointer.height,
+        });
+    }
+    let mut images = Vec::new();
+    for preview in &data.preview {
+        let image = match &preview.image {
+            // A preview is fine without its image.
+            Some(pointer) => manager
+                .get_attachment(pointer)
+                .await
+                .ok()
+                .map(|bytes| Attachment {
+                    content_type: pointer.content_type().to_string(),
+                    file_name: None,
+                    bytes,
+                    width: pointer.width,
+                    height: pointer.height,
+                }),
+            None => None,
+        };
+        images.push(image);
+    }
+    Ok((attachments, images))
 }
 
 /// When each conversation was last read, kept in a small text file next to the store:
@@ -457,18 +607,28 @@ impl ReadMarks {
     /// Number of messages of `discussion` received after it was last read.
     pub fn unread_count(&self, thread: &Thread, discussion: &Discussion) -> usize {
         let last_read = self.marks.get(&thread_key(thread)).copied().unwrap_or(0);
-        discussion.messages.iter().filter(|m| !m.from_me && m.id > last_read).count()
+        discussion
+            .messages
+            .iter()
+            .filter(|m| !m.from_me && m.id > last_read)
+            .count()
     }
 
     /// Records that every message of `discussion` is read, and saves.
     pub fn mark_read(&mut self, thread: &Thread, discussion: &Discussion) -> std::io::Result<()> {
-        let Some(newest) = discussion.messages.iter().map(|m| m.id).max() else { return Ok(()) };
+        let Some(newest) = discussion.messages.iter().map(|m| m.id).max() else {
+            return Ok(());
+        };
         let mark = self.marks.entry(thread_key(thread)).or_default();
         if *mark >= newest {
             return Ok(());
         }
         *mark = newest;
-        let content: String = self.marks.iter().map(|(key, id)| format!("{key} {id}\n")).collect();
+        let content: String = self
+            .marks
+            .iter()
+            .map(|(key, id)| format!("{key} {id}\n"))
+            .collect();
         std::fs::write(&self.path, content)
     }
 }
@@ -483,14 +643,21 @@ pub struct Pins {
 impl Pins {
     /// Loads the pins; a missing file means nothing is pinned.
     pub fn load(path: PathBuf) -> Self {
-        let keys = std::fs::read_to_string(&path).unwrap_or_default().lines().map(str::to_string).collect();
+        let keys = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
         Pins { path, keys }
     }
 
     /// Rank of `thread` in the pinned list, if pinned.
     pub fn rank(&self, thread: &Thread) -> Option<u32> {
         let key = thread_key(thread);
-        self.keys.iter().position(|k| *k == key).map(|rank| rank as u32)
+        self.keys
+            .iter()
+            .position(|k| *k == key)
+            .map(|rank| rank as u32)
     }
 
     /// Pins `thread` at the end of the list, or unpins it, and saves.
@@ -524,7 +691,12 @@ pub async fn load_discussions(
     let mut discussions = Vec::new();
     for conversation in conversations {
         let mut discussion = Discussion::new(conversation.title.clone());
-        let mut contents: Vec<Content> = manager.store().messages(&conversation.thread, ..).await?.flatten().collect();
+        let mut contents: Vec<Content> = manager
+            .store()
+            .messages(&conversation.thread, ..)
+            .await?
+            .flatten()
+            .collect();
         contents.sort_by_key(|c| c.metadata.client_timestamp);
         for content in &contents {
             match directory.reaction(content) {
@@ -560,7 +732,9 @@ fn from_body_ranges(text: &str, ranges: &[BodyRange]) -> Vec<Styled> {
     ranges
         .iter()
         .filter_map(|range| {
-            let Some(AssociatedValue::Style(style)) = range.associated_value else { return None };
+            let Some(AssociatedValue::Style(style)) = range.associated_value else {
+                return None;
+            };
             let style = match BodyStyle::try_from(style).ok()? {
                 BodyStyle::Bold => Style::Bold,
                 BodyStyle::Italic => Style::Italic,
@@ -568,7 +742,10 @@ fn from_body_ranges(text: &str, ranges: &[BodyRange]) -> Vec<Styled> {
                 _ => return None,
             };
             let start = range.start? as usize;
-            let (start, end) = (byte_offset(text, start), byte_offset(text, start + range.length? as usize));
+            let (start, end) = (
+                byte_offset(text, start),
+                byte_offset(text, start + range.length? as usize),
+            );
             (start < end).then_some(Styled { start, end, style })
         })
         .collect()
@@ -601,12 +778,16 @@ pub async fn send(
     thread: &Thread,
     text: &str,
     styles: &[Styled],
+    attachments: Vec<Attachment>,
     quote: Option<(usize, &Message)>,
 ) -> Result<Message, SignalError> {
     let timestamp = Utc::now().timestamp_millis() as u64;
+    let local_attachments = attachments.clone();
+    let attachment_pointers = upload_attachments(manager, attachments).await?;
     let message = DataMessage {
-        body: Some(text.to_string()),
+        body: (!text.is_empty()).then(|| text.to_string()),
         body_ranges: to_body_ranges(text, styles),
+        attachments: attachment_pointers,
         quote: quote.map(|(_, q)| Quote {
             id: Some(q.id),
             author_aci: q.author.clone(),
@@ -619,7 +800,37 @@ pub async fn send(
     let mut sent = Message::mine(timestamp, text.to_string(), quote.map(|(i, _)| i), false);
     sent.author = Some(own_aci(manager));
     sent.styles = styles.to_vec();
+    sent.attachments = local_attachments;
     Ok(sent)
+}
+
+async fn upload_attachments(
+    manager: &SignalManager,
+    attachments: Vec<Attachment>,
+) -> Result<Vec<presage::proto::AttachmentPointer>, SignalError> {
+    let specs = attachments
+        .into_iter()
+        .map(|attachment| {
+            let spec = AttachmentSpec {
+                content_type: attachment.content_type,
+                length: attachment.bytes.len(),
+                file_name: attachment.file_name,
+                preview: None,
+                voice_note: None,
+                borderless: None,
+                width: attachment.width,
+                height: attachment.height,
+                caption: None,
+                blur_hash: None,
+            };
+            (spec, attachment.bytes)
+        })
+        .collect();
+    let uploaded = manager.upload_attachments(specs).await?;
+    uploaded
+        .into_iter()
+        .map(|result| result.map_err(|e| SignalError::from(MessageSenderError::from(e))))
+        .collect()
 }
 
 /// Sets our reaction `emoji` to `target`, or removes it. Returns the update to apply.
@@ -651,10 +862,16 @@ pub async fn react(
 }
 
 /// Deletes our message `target` for everyone.
-pub async fn delete(manager: &mut SignalManager, thread: &Thread, target: &Message) -> Result<(), SignalError> {
+pub async fn delete(
+    manager: &mut SignalManager,
+    thread: &Thread,
+    target: &Message,
+) -> Result<(), SignalError> {
     let timestamp = Utc::now().timestamp_millis() as u64;
     let message = DataMessage {
-        delete: Some(Delete { target_sent_timestamp: Some(target.id) }),
+        delete: Some(Delete {
+            target_sent_timestamp: Some(target.id),
+        }),
         ..Default::default()
     };
     send_data_message(manager, thread, message, timestamp).await
@@ -676,13 +893,19 @@ async fn send_data_message(
     match thread {
         Thread::Contact(recipient) => manager.send_message(*recipient, message, timestamp).await,
         Thread::Group(master_key) => {
-            let revision = manager.store().group(*master_key).await?.map_or(0, |g| g.revision);
+            let revision = manager
+                .store()
+                .group(*master_key)
+                .await?
+                .map_or(0, |g| g.revision);
             message.group_v2 = Some(GroupContextV2 {
                 master_key: Some(master_key.to_vec()),
                 revision: Some(revision),
                 ..Default::default()
             });
-            manager.send_message_to_group(master_key, message, timestamp).await
+            manager
+                .send_message_to_group(master_key, message, timestamp)
+                .await
         }
     }
 }
@@ -695,7 +918,11 @@ mod tests {
     fn body_ranges_count_utf16_units() {
         // "é" is one UTF-16 unit but two bytes, "🚀" two units and four bytes.
         let text = "é🚀 bold end";
-        let styles = vec![Styled { start: 7, end: 11, style: Style::Bold }];
+        let styles = vec![Styled {
+            start: 7,
+            end: 11,
+            style: Style::Bold,
+        }];
         let ranges = to_body_ranges(text, &styles);
         assert_eq!((ranges[0].start, ranges[0].length), (Some(4), Some(4)));
         assert_eq!(from_body_ranges(text, &ranges), styles);
