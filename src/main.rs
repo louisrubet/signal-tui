@@ -1,6 +1,6 @@
 //! signal-tui: a terminal Signal client, linked as a secondary device of your phone.
 //!
-//!   signal-tui [--reset]
+//!   signal-tui [--reset | --version]
 //!
 //! On the first run, scan the QR code from the phone (Settings > Linked devices). The store
 //! lives in `~/.local/share/signal-tui/` (or `$SIGNAL_TUI_DB`). `--reset` deletes it first,
@@ -21,10 +21,16 @@ use signal_tui::tui::{Action, App, TerminalGuard};
 use signal_tui::qr;
 use presage::model::messages::Received;
 
-const USAGE: &str = "usage: signal-tui [--reset]";
+const USAGE: &str = "usage: signal-tui [--reset | --version]";
 const DEVICE_NAME: &str = "signal-tui";
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "--version" {
+        println!("{}", env!("SIGNAL_TUI_VERSION"));
+        return;
+    }
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

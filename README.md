@@ -24,6 +24,8 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 
 `signal-tui --reset` forgets the link and starts over. Also remove the old device from your phone.
 
+`signal-tui --version` prints the release version. On an exact tag it prints the tag, for example `v1.0.0`; after the latest tag it prints `<tag>+<5-char-sha>`.
+
 ## Keys
 
 | Key | Action |
