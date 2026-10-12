@@ -23,7 +23,7 @@ rand = "0.9"
 # Same sqlx (and SQLCipher) as presage-store-sqlite, to encrypt an existing plain store.
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
 # :shortcode: to emoji table (tip of main).
-emoji-expander = { git = "https://github.com/louisrubet/emoji-expander", rev = "b7ad5afbc5519624e0c1370a353c27ff2007fc34" }
+emoji-expander = { git = "https://github.com/louisrubet/emoji-expander", tag = "v1.2.0" }
 qrcode = { version = "0.14", default-features = false }
 
 [target.'cfg(unix)'.dependencies]

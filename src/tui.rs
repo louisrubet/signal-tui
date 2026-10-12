@@ -1132,11 +1132,11 @@ mod tests {
         let mut app = opened();
         app.handle_key(key(KeyCode::Enter));
         type_text(&mut app, "go :ro");
-        assert!(screen(&mut app).contains(":ro  [\u{1f680} rocket]"));
+        assert!(screen(&mut app).contains(":ro  [\u{1f916} robot_face]"));
         assert_eq!(app.handle_key(key(KeyCode::Enter)), None, "Enter picks, does not send");
         type_text(&mut app, " now");
         let send = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(send, Some(Action::Send { discussion: 0, text: "go \u{1f680} now".to_string(), styles: vec![], reply_to: None }));
+        assert_eq!(send, Some(Action::Send { discussion: 0, text: "go \u{1f916} now".to_string(), styles: vec![], reply_to: None }));
     }
 
     #[test]
