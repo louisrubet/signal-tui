@@ -4,6 +4,16 @@ Running `signal` from your terminal.
 
 A Signal client for the terminal, linked to your phone as a secondary device (like Signal Desktop). Built on [presage](https://github.com/whisperfish/presage).
 
+![A chat with photos, link previews, emojis and reactions](docs/screenshots/chat.png)
+
+- **Images** shown as thumbnails, pasted with `Ctrl+V`, opened full size with `o`
+- **Link previews** with title, description and image, as Signal sends them
+- **Emojis**: reactions, `:shortcode:` completion
+- **Replies, forwards, deletion**, `**bold**` `*italic*` `~strikethrough~`
+- **Pinned chats**, unread counts, desktop notifications
+
+<sub>Photos: Wikimedia Commons, CC BY-SA, credits in [examples/demo](examples/demo/README.md).</sub>
+
 ## Install
 
 Needs Rust ≥ 1.89, `protoc` (`protobuf-compiler` package) and a C compiler.
@@ -36,7 +46,8 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 | `e` | react to the selected message (`1`–`6` or a `:shortcode:`) |
 | `f` | forward the selected message |
 | `c` | copy the selected message (OSC 52) |
-| `o` | open the links of the selected message |
+| `o` | open the links and images of the selected message |
+| `Ctrl+V` | paste the image in the clipboard |
 | `Del` | delete your message for everyone (within 24 h) |
 | `P` | pin / unpin the selected chat |
 | `p` | parameters (from the chat list) |
@@ -46,6 +57,8 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 ## Good to know
 
 - **Formatting**: `**bold**`, `*italic*`, `~strikethrough~` apply when closed (Esc right after undoes), and are sent as Signal formatting.
+- **Thumbnails** need a terminal speaking the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) with Unicode placeholders: [Ghostty](https://ghostty.org), [kitty](https://sw.kovidgoyal.net/kitty/). Elsewhere images show as `[image #1]`, and `o` opens them.
+- **Downloads**: images are fetched when they arrive or when a chat is opened; videos and files wait for `o`.
 - **No history.** Signal doesn't send past messages to linked devices. You only see messages received since linking.
 - **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.
 - **Store**: `~/.local/share/signal-tui/`, override with `SIGNAL_TUI_DB`. See [Security](#security).
@@ -66,7 +79,7 @@ The store holds everything this linked device needs: its identity keys and crede
 ## Dev
 
 ```sh
-cargo run --example mock_tui      # the UI with fake chats, no Signal
+cargo run --example mock_tui      # the UI with fake chats, no Signal (`-- --open`: first chat)
 cargo run --example link_device   # link, then print chats as text
 cargo test                        # add `-- --ignored` for the network test
 ```

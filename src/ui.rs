@@ -246,34 +246,39 @@ fn push_media(
             image(out, thumb);
         }
         let bar = "\u{2502} ";
+        let style = |line: &str, style| {
+            vec![Styled {
+                start: bar.len(),
+                end: line.len(),
+                style,
+            }]
+        };
+        let mut card = Vec::new();
         if !preview.title.is_empty() {
-            out.push(RenderLine {
-                styles: vec![Styled {
-                    start: bar.len(),
-                    end: bar.len() + preview.title.len(),
-                    style: Style::Bold,
-                }],
-                ..text(format!("{bar}{}", preview.title))
-            });
+            let line = format!("{bar}{}", preview.title);
+            card.push((style(&line, Style::Bold), line));
         }
         let description = &preview.description;
         for r in wrap_ranges(description, width.saturating_sub(2))
             .into_iter()
             .take(PREVIEW_LINES)
         {
-            out.push(text(format!("{bar}{}", &description[r])));
+            card.push((Vec::new(), format!("{bar}{}", &description[r])));
         }
         if let Some(host) = url::Url::parse(&preview.url)
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
         {
+            let line = format!("{bar}{host}");
+            card.push((style(&line, Style::Italic), line));
+        }
+        // Lines of the same width, so that the bars line up on the right too.
+        let card_width = card.iter().map(|(_, l)| width_of(l)).max().unwrap_or(0);
+        for (styles, line) in card {
+            let pad = " ".repeat(card_width - width_of(&line));
             out.push(RenderLine {
-                styles: vec![Styled {
-                    start: bar.len(),
-                    end: bar.len() + host.len(),
-                    style: Style::Italic,
-                }],
-                ..text(format!("{bar}{host}"))
+                styles,
+                ..text(format!("{line}{pad}"))
             });
         }
     }
@@ -501,7 +506,7 @@ mod tests {
 
     #[test]
     fn link_previews_show_as_cards() {
-        use super::{Thumbnails, build_discussion_lines};
+        use super::{Thumbnails, build_discussion_lines, width_of};
         use crate::data::{Discussion, LinkPreview, Message};
         let mut message = Message::mine(1, "https://example.org/a".to_string(), None, false);
         message.previews = vec![LinkPreview {
@@ -515,8 +520,14 @@ mod tests {
             ..Discussion::new("t".to_string())
         };
         let lines = build_discussion_lines(&discussion, 40, None, &Thumbnails::default());
+        let card = &texts(&lines)[2..5];
+        assert!(
+            card.iter().all(|l| width_of(l) == width_of(card[2])),
+            "same width, for the bars to line up on the right"
+        );
+        let trimmed: Vec<&str> = texts(&lines).iter().map(|l| l.trim_end()).collect();
         assert_eq!(
-            &texts(&lines)[1..5],
+            &trimmed[1..5],
             [
                 "https://example.org/a",
                 "\u{2502} Example",
