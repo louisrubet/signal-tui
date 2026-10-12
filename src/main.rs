@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::error::Error;
 use std::io::{Write, stdout};
+use std::path::Path;
 use std::pin::pin;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,7 @@ use crossterm::event::{Event, EventStream};
 use crossterm::terminal;
 use futures::StreamExt;
 use presage::model::messages::Received;
+use presage_store_sqlite::SqliteStore;
 use signal_tui::data::{self, Discussion};
 use signal_tui::graphics::Thumbnails;
 use signal_tui::qr;
@@ -62,6 +64,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let store = signal_tui::store_key::open_encrypted(db).await?;
+    let result = chat(store.clone(), &path).await;
+    // Before exiting: SQLCipher crashes when a connection closes after its cleanup.
+    let _ = tokio::time::timeout(Duration::from_secs(2), store.close()).await;
+    result
+}
+
+/// Links or loads the account from `store` (at `path`), syncs, then runs the interface.
+async fn chat(store: SqliteStore, path: &Path) -> Result<(), Box<dyn Error>> {
     let (mut manager, linked) = signal::link_or_load(store, DEVICE_NAME, |url| {
         println!("Scan this QR code from Signal on your phone (Settings > Linked devices):");
         qr::print_qr(url.as_str());
