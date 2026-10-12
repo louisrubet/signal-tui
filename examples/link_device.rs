@@ -14,8 +14,17 @@ use std::time::Duration;
 
 use signal_tui::{qr, signal};
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("cannot create the Tokio runtime");
+    let local = tokio::task::LocalSet::new();
+
+    runtime.block_on(local.run_until(async_main()));
+}
+
+async fn async_main() {
     let path = signal::default_store_path().expect("cannot create the store directory");
     let db = path.to_str().expect("the store path is not valid UTF-8");
 

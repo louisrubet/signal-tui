@@ -24,9 +24,14 @@ use presage::model::messages::Received;
 const USAGE: &str = "usage: signal-tui [--reset]";
 const DEVICE_NAME: &str = "signal-tui";
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    if let Err(e) = run().await {
+fn main() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("cannot create the Tokio runtime");
+    let local = tokio::task::LocalSet::new();
+
+    if let Err(e) = runtime.block_on(local.run_until(run())) {
         eprintln!("signal-tui: {e}");
         std::process::exit(1);
     }
@@ -75,9 +80,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let mut receiver = manager.clone();
     let mut incoming = pin!(receiver.receive_messages().await?);
     let mut incoming_open = true;
-    let mut keys = EventStream::new();
 
     let _terminal = TerminalGuard::enter()?;
+    let mut keys = EventStream::new();
     let mut out = stdout();
     loop {
         let (w, h) = terminal::size()?;
