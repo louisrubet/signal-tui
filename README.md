@@ -40,7 +40,7 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 
 | Key | Action |
 |---|---|
-| `↑` `↓` | select chat / message |
+| `↑` `↓` | select chat / message (in a chat, `↑` starts selecting) |
 | `Enter` | open chat, new message, send |
 | `r` | reply to the selected message |
 | `e` | react to the selected message (`1`–`6` or a `:shortcode:`) |
@@ -51,7 +51,7 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 | `Del` | delete your message for everyone (within 24 h) |
 | `P` | pin / unpin the selected chat |
 | `p` | parameters (from the chat list) |
-| `Esc` | back |
+| `Esc` | unselect, back |
 | `q` | quit |
 
 ## Good to know

@@ -82,7 +82,10 @@ enum Screen {
     List { selected: usize, scroll: usize },
     Discussion {
         discussion_idx: usize,
+        /// The selected message, or with no selection the one kept in view.
         selected_msg: usize,
+        /// Whether a message is selected: from the first Up, until Esc.
+        selecting: bool,
         scroll: usize,
         /// `Some` while the user is typing a new message.
         /// Boxed: the draft (with its formatting undo) is much larger than the other states.
@@ -437,8 +440,8 @@ impl App {
     }
 
     /// Appends a message to a discussion. If that discussion is open, the selection follows
-    /// the new message when it is ours or when the previous last message was selected;
-    /// otherwise a received message marks it unread.
+    /// the new message when it is ours (and is then hidden) or when the previous last message
+    /// was selected; otherwise a received message marks it unread.
     pub fn push_message(&mut self, discussion: usize, message: Message) {
         let open = self.is_open(discussion);
         let target = &mut self.discussions[discussion];
@@ -457,12 +460,15 @@ impl App {
         if let Screen::Discussion {
             discussion_idx,
             selected_msg,
+            selecting,
             ..
         } = &mut self.screen
             && *discussion_idx == discussion
             && (from_me || *selected_msg == was_last)
         {
             *selected_msg = last;
+            // Once ours is sent, back to reading the end of the discussion.
+            *selecting &= !from_me;
         }
     }
 
@@ -488,6 +494,7 @@ impl App {
             self.screen = Screen::Discussion {
                 discussion_idx: selected,
                 selected_msg,
+                selecting: false,
                 scroll: 0,
                 composing: None,
                 reacting: None,
@@ -537,6 +544,7 @@ impl App {
             Screen::Discussion {
                 discussion_idx,
                 selected_msg,
+                selecting,
                 composing,
                 reacting,
                 deleting,
@@ -706,7 +714,10 @@ impl App {
                     }
                 } else {
                     match key.code {
+                        // The first Up selects the message in view, at the bottom.
+                        KeyCode::Up if !*selecting => *selecting = true,
                         KeyCode::Up => *selected_msg = selected_msg.saturating_sub(1),
+                        // With no selection, Down, PageUp and PageDown scroll.
                         KeyCode::Down => {
                             if *selected_msg + 1 < messages.len() {
                                 *selected_msg += 1;
@@ -720,6 +731,7 @@ impl App {
                                 .min(messages.len().saturating_sub(1))
                         }
                         KeyCode::Enter => *composing = Some(Compose::new("", None)),
+                        KeyCode::Esc if *selecting => *selecting = false,
                         KeyCode::Esc => {
                             let back_to = *discussion_idx;
                             self.screen = Screen::List {
@@ -728,11 +740,13 @@ impl App {
                             };
                         }
                         KeyCode::Char('q') => return Some(Action::Quit),
-                        // Actions on the selected message (there is none in an empty discussion).
-                        // Actions need a message, and there is nothing to act on in a deleted one.
+                        // Actions need a selected message, and there is nothing to act on in a
+                        // deleted one. With no selection, their letters start a new message.
+                        KeyCode::Delete if !*selecting => {}
                         KeyCode::Char('r' | 'f' | 'c' | 'o' | 'e') | KeyCode::Delete
-                            if messages.get(*selected_msg).is_none_or(|m| m.deleted) => {}
-                        KeyCode::Delete => {
+                            if *selecting
+                                && messages.get(*selected_msg).is_none_or(|m| m.deleted) => {}
+                        KeyCode::Delete if *selecting => {
                             let now_ms = chrono::Utc::now().timestamp_millis() as u64;
                             if messages[*selected_msg].deletable(now_ms) {
                                 *deleting = true;
@@ -743,11 +757,11 @@ impl App {
                                 );
                             }
                         }
-                        KeyCode::Char('e') => *reacting = Some(Picker::default()),
-                        KeyCode::Char('r') => {
+                        KeyCode::Char('e') if *selecting => *reacting = Some(Picker::default()),
+                        KeyCode::Char('r') if *selecting => {
                             *composing = Some(Compose::new("", Some(*selected_msg)))
                         }
-                        KeyCode::Char('f') => {
+                        KeyCode::Char('f') if *selecting => {
                             let (discussion_idx, msg_idx) = (*discussion_idx, *selected_msg);
                             self.screen = Screen::Forward {
                                 discussion_idx,
@@ -756,11 +770,11 @@ impl App {
                                 scroll: 0,
                             };
                         }
-                        KeyCode::Char('c') => {
+                        KeyCode::Char('c') if *selecting => {
                             self.clipboard = Some(messages[*selected_msg].text.clone());
                             self.status = Some("Message copied".to_string());
                         }
-                        KeyCode::Char('o') => {
+                        KeyCode::Char('o') if *selecting => {
                             if !messages[*selected_msg].remote_attachments.is_empty() {
                                 return Some(Action::FetchAttachments {
                                     discussion: *discussion_idx,
@@ -807,6 +821,7 @@ impl App {
                     self.screen = Screen::Discussion {
                         discussion_idx,
                         selected_msg,
+                        selecting: true,
                         scroll: 0,
                         composing: None,
                         reacting: None,
@@ -820,6 +835,7 @@ impl App {
                     self.screen = Screen::Discussion {
                         discussion_idx,
                         selected_msg,
+                        selecting: true,
                         scroll: 0,
                         composing: None,
                         reacting: None,
@@ -914,6 +930,7 @@ impl App {
             Screen::Discussion {
                 discussion_idx,
                 selected_msg,
+                selecting,
                 scroll,
                 composing,
                 reacting,
@@ -934,6 +951,7 @@ impl App {
                         .map(|t| t.name.as_str())
                         .collect::<Vec<_>>(),
                     *selected_msg,
+                    *selecting,
                     scroll,
                     composing.as_deref(),
                     reacting.as_ref(),
@@ -1308,7 +1326,9 @@ fn draw_discussion(
     new_from: Option<(usize, usize)>,
     // Names of the people typing.
     typing: &[&str],
+    // Kept in view, and shown selected when `selecting`.
     selected_msg: usize,
+    selecting: bool,
     scroll: &mut usize,
     composing: Option<&Compose>,
     // The reaction picker, while picking.
@@ -1393,7 +1413,11 @@ fn draw_discussion(
                 )]
             }
             None => {
-                let help = "\u{2191}/\u{2193} navigate   r reply   e react   f forward   c copy   o open links   Del delete   Enter new message   Esc back   q quit";
+                let help = if selecting {
+                    "\u{2191}/\u{2193} navigate   r reply   e react   f forward   c copy   o open links   Del delete   Enter new message   Esc unselect   q quit"
+                } else {
+                    "\u{2191} select   Enter new message   Esc back   q quit"
+                };
                 vec![(status.unwrap_or(help).to_string(), Vec::new())]
             }
         },
@@ -1451,8 +1475,9 @@ fn draw_discussion(
             visible_messages.extend(rl.msg_idx);
             let (text, styles) = ui::render_line(rl, width);
             // Reversed, the placeholders would lose their color: the image id.
-            let selected =
-                rl.msg_idx == Some(selected_msg) && !matches!(rl.kind, ui::LineKind::Image { .. });
+            let selected = selecting
+                && rl.msg_idx == Some(selected_msg)
+                && !matches!(rl.kind, ui::LineKind::Image { .. });
             print_styled(out, y, &text, &styles, selected)?;
         } else {
             print_row(out, y, &" ".repeat(width), false)?;
@@ -1496,6 +1521,13 @@ mod tests {
     fn opened() -> App {
         let mut app = app();
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(0)));
+        app
+    }
+
+    /// The first discussion opened, its last message selected.
+    fn selected() -> App {
+        let mut app = opened();
+        app.handle_key(key(KeyCode::Up));
         app
     }
 
@@ -1860,7 +1892,7 @@ mod tests {
 
     #[test]
     fn opening_received_attachments_downloads_them() {
-        let mut app = opened();
+        let mut app = selected();
         let last = app.discussions[0].messages.len() - 1;
         app.discussions[0].messages[last].remote_attachments = vec!["image/jpeg".to_string()];
         assert_eq!(
@@ -1874,7 +1906,7 @@ mod tests {
 
     #[test]
     fn reply_quotes_the_selected_message() {
-        let mut app = opened();
+        let mut app = selected();
         let last = app.discussions[0].messages.len() - 1;
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Char('r')));
@@ -1893,7 +1925,7 @@ mod tests {
 
     #[test]
     fn forward_to_the_chosen_discussion() {
-        let mut app = opened();
+        let mut app = selected();
         let last = app.discussions[0].messages.len() - 1;
         app.handle_key(key(KeyCode::Char('f')));
         app.handle_key(key(KeyCode::Down));
@@ -2057,10 +2089,11 @@ mod tests {
             .map(|i| Message::mine(i, format!("message {i}"), None, false))
             .collect();
         let mut app = App::new(vec![discussion]);
-        app.handle_key(key(KeyCode::Enter)); // last message (39) selected
+        app.handle_key(key(KeyCode::Enter)); // last message (39) in view
         let mut out = Vec::new();
         app.draw(&mut out, 80, 23).unwrap(); // 20 lines of messages: 3 lines each, 7 messages
         app.handle_key(key(KeyCode::PageUp));
+        app.handle_key(key(KeyCode::Up)); // selects the message in view
         // Reply to read which message is selected.
         app.handle_key(key(KeyCode::Char('r')));
         type_text(&mut app, "x");
@@ -2082,7 +2115,7 @@ mod tests {
 
     #[test]
     fn react_with_a_quick_pick_or_a_shortcode() {
-        let mut app = opened();
+        let mut app = selected();
         let last = app.discussions[0].messages.len() - 1;
         app.handle_key(key(KeyCode::Char('e')));
         assert!(
@@ -2132,7 +2165,7 @@ mod tests {
 
     #[test]
     fn arrows_browse_all_the_matches_of_a_filter() {
-        let mut app = opened();
+        let mut app = selected();
         let last = app.discussions[0].messages.len() - 1;
         app.handle_key(key(KeyCode::Char('e')));
         app.handle_key(key(KeyCode::Right));
@@ -2189,6 +2222,7 @@ mod tests {
         app.push_message(0, Message::mine(now_ms, "oops".to_string(), None, false));
         let last = app.discussions[0].messages.len() - 1;
 
+        app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Delete));
         assert!(screen(&mut app).contains("Delete this message for everyone?"));
         assert_eq!(
@@ -2278,10 +2312,11 @@ mod tests {
         );
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Opened(1)));
         assert_eq!(app.discussions[1].unread, 0);
-        // A line above the first new message, which is selected.
+        // A line above the first new message, which is in view and selected by Up.
         let text = screen(&mut app);
         assert!(text.find("2 new messages").unwrap() < text.find("I'll bring the wine.").unwrap());
         assert!(text.find("Don't forget dinner").unwrap() < text.find("2 new messages").unwrap());
+        app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Char('r')));
         type_text(&mut app, "x");
         let send = app.handle_key(key(KeyCode::Enter));
@@ -2297,9 +2332,41 @@ mod tests {
     }
 
     #[test]
+    fn up_selects_and_esc_unselects() {
+        let mut app = opened();
+        assert!(
+            screen(&mut app).contains("\u{2191} select"),
+            "nothing selected"
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Delete)), None);
+        assert!(!screen(&mut app).contains("Delete this message"));
+        app.handle_key(key(KeyCode::Up));
+        assert!(
+            screen(&mut app).contains("r reply"),
+            "last message selected"
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.is_open(0), "Esc first unselects");
+        // With no selection, the action letters start a new message.
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Action::Send {
+                discussion: 0,
+                text: "c".to_string(),
+                styles: vec![],
+                reply_to: None
+            })
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.is_open(0), "then goes back to the list");
+    }
+
+    #[test]
     fn selection_follows_pushed_messages() {
         let mut app = opened();
         app.push_message(0, Message::mine(1, "new".to_string(), None, false));
+        app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Char('r')));
         type_text(&mut app, "x");
         let last = app.discussions[0].messages.len() - 1;
