@@ -75,10 +75,10 @@ pub struct Thumbnails {
 }
 
 impl Thumbnails {
-    /// Enabled in terminals known to support placeholders: kitty and Ghostty.
+    /// Enabled in terminals known to support placeholders: kitty, Ghostty and Rio.
     pub fn detect() -> Self {
         let env = |name| std::env::var(name).unwrap_or_default();
-        let enabled = env("TERM_PROGRAM") == "ghostty"
+        let enabled = matches!(env("TERM_PROGRAM").as_str(), "ghostty" | "rio")
             || env("TERM") == "xterm-kitty"
             || std::env::var_os("KITTY_WINDOW_ID").is_some();
         let cell = crossterm::terminal::window_size()

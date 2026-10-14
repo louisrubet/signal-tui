@@ -36,6 +36,20 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 
 `signal-tui --version` prints the release version. On an exact tag it prints the tag, for example `v1.0.0`; after the latest tag it prints `<tag>+<5-char-sha>`.
 
+## Terminal
+
+Any terminal works. For thumbnails, use one that speaks the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) **with Unicode placeholders**:
+
+| Terminal | Linux | macOS | Windows |
+|---|:-:|:-:|:-:|
+| [Ghostty](https://ghostty.org) (recommended) | ✓ | ✓ | |
+| [kitty](https://sw.kovidgoyal.net/kitty/) | ✓ | ✓ | |
+| [Rio](https://rioterm.com) | ✓ | ✓ | ✓ |
+
+On Windows, Rio is the only native option; kitty also runs under WSL with WSLg.
+
+Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside tmux…) everything works but graphics are reduced: images show as `[image #1]` and open full size with `o`, link previews show without their image.
+
 ## Keys
 
 | Key | Action |
@@ -57,7 +71,6 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 ## Good to know
 
 - **Formatting**: `**bold**`, `*italic*`, `~strikethrough~` apply when closed (Esc right after undoes), and are sent as Signal formatting.
-- **Thumbnails** need a terminal speaking the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) with Unicode placeholders: [Ghostty](https://ghostty.org), [kitty](https://sw.kovidgoyal.net/kitty/). Elsewhere images show as `[image #1]`, and `o` opens them.
 - **Downloads**: images are fetched when they arrive or when a chat is opened; videos and files wait for `o`.
 - **No history.** Signal doesn't send past messages to linked devices. You only see messages received since linking.
 - **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.
