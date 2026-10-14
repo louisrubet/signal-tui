@@ -13,10 +13,12 @@ use image::ImageFormat;
 
 use crate::data::Message;
 
-/// Largest thumbnail of an attachment, in cells (columns, rows).
-const MAX: (u32, u32) = (40, 12);
-/// Largest thumbnail of a link preview image.
-const PREVIEW_MAX: (u32, u32) = (20, 6);
+/// Width of a thumbnail in pixels, as in Signal Desktop: from 200 to 300, the height
+/// following up to 450.
+const WIDTH: (u32, u32) = (200, 300);
+const MAX_HEIGHT: u32 = 450;
+/// Side of the icon of a link preview whose image is smaller than [`WIDTH`]`.0` both ways.
+const ICON: u32 = 72;
 /// Thumbnails of link previews come after the attachments, from this index.
 const PREVIEWS: usize = 1 << 16;
 /// Base64 bytes per escape sequence, as the protocol asks.
@@ -24,7 +26,7 @@ const CHUNK: usize = 4096;
 /// Placeholder character: the cells of an image are drawn with it.
 const PLACEHOLDER: char = '\u{10EEEE}';
 /// Combining marks giving the row and column of a placeholder cell (start of kitty's
-/// `rowcolumn-diacritics.txt`, enough for [`MAX`]).
+/// `rowcolumn-diacritics.txt`: thumbnails are at most 64 cells both ways).
 const DIACRITICS: [char; 64] = [
     '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}', '\u{033E}', '\u{033F}',
     '\u{0346}', '\u{034A}', '\u{034B}', '\u{034C}', '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}',
@@ -131,19 +133,19 @@ impl Thumbnails {
                 .attachments
                 .iter()
                 .enumerate()
-                .map(|(i, a)| (i, a, MAX));
-            let previews = message.previews.iter().enumerate().filter_map(|(i, p)| {
-                p.image
-                    .as_ref()
-                    .map(|image| (PREVIEWS + i, image, PREVIEW_MAX))
-            });
-            for (index, attachment, max) in attachments.chain(previews) {
+                .map(|(i, a)| (i, a, false));
+            let previews = message
+                .previews
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| p.image.as_ref().map(|image| (PREVIEWS + i, image, true)));
+            for (index, attachment, preview) in attachments.chain(previews) {
                 if !attachment.content_type.starts_with("image/")
                     || self.thumbs.contains_key(&(message.id, index))
                 {
                     continue;
                 }
-                let thumb = match thumbnail(&attachment.bytes, self.cell, max) {
+                let thumb = match thumbnail(&attachment.bytes, self.cell, preview) {
                     Some((png, cols, rows)) => {
                         let thumb = Thumb {
                             id: self.next_id,
@@ -171,19 +173,38 @@ impl Thumbnails {
     }
 }
 
-/// The image in `bytes` scaled down to at most `max` (columns, rows) cells of `cell`
-/// pixels, as PNG, with its size in cells.
-fn thumbnail(bytes: &[u8], cell: (u32, u32), max: (u32, u32)) -> Option<(Vec<u8>, u16, u16)> {
+/// The image in `bytes` at the size Signal Desktop shows it (a small image of a link
+/// `preview` as an icon), as PNG, with its size in cells of `cell` pixels.
+fn thumbnail(bytes: &[u8], cell: (u32, u32), preview: bool) -> Option<(Vec<u8>, u16, u16)> {
     let image = image::load_from_memory(bytes).ok()?;
+    let (width, height) = size(image.width(), image.height(), preview);
+    let image = image.resize(width, height, image::imageops::FilterType::CatmullRom);
     let (cw, ch) = cell;
-    let image = image.thumbnail(max.0 * cw, max.1 * ch);
-    let cols = image.width().div_ceil(cw).clamp(1, max.0) as u16;
-    let rows = image.height().div_ceil(ch).clamp(1, max.1) as u16;
+    let max = DIACRITICS.len() as u32;
+    let cols = image.width().div_ceil(cw).clamp(1, max) as u16;
+    let rows = image.height().div_ceil(ch).clamp(1, max) as u16;
     let mut png = Vec::new();
     image
         .write_to(&mut io::Cursor::new(&mut png), ImageFormat::Png)
         .ok()?;
     Some((png, cols, rows))
+}
+
+/// Size in pixels of a `width`×`height` image in a message, keeping its proportions: a
+/// link `preview` image smaller than the minimum width both ways is an icon.
+fn size(width: u32, height: u32, preview: bool) -> (u32, u32) {
+    let (w, h) = (width.max(1) as f64, height.max(1) as f64);
+    let small = width < WIDTH.0 && height < WIDTH.0;
+    let scale = if preview && small {
+        ICON as f64 / w.max(h)
+    } else {
+        let target = w.clamp(WIDTH.0 as f64, WIDTH.1 as f64);
+        (target / w).min(MAX_HEIGHT as f64 / h)
+    };
+    (
+        ((w * scale).round() as u32).max(1),
+        ((h * scale).round() as u32).max(1),
+    )
 }
 
 /// Sends `png` as the virtual placement `thumb`, in chunks, with no reply.
@@ -231,7 +252,20 @@ mod tests {
         image
             .write_to(&mut io::Cursor::new(&mut png), ImageFormat::Png)
             .unwrap();
-        let (_, cols, rows) = thumbnail(&png, (10, 20), MAX).unwrap();
-        assert_eq!((cols, rows), (40, 10));
+        let (_, cols, rows) = thumbnail(&png, (10, 20), false).unwrap();
+        assert_eq!((cols, rows), (30, 8));
+    }
+
+    #[test]
+    fn sizes_follow_signal_desktop() {
+        assert_eq!(size(1000, 500, false), (300, 150), "wide");
+        assert_eq!(size(1000, 3000, false), (150, 450), "tall");
+        assert_eq!(size(100, 50, false), (200, 100), "small, enlarged");
+        assert_eq!(size(600, 900, true), (300, 450), "large preview image");
+        assert_eq!(
+            size(150, 100, true),
+            (72, 48),
+            "small preview image: an icon"
+        );
     }
 }
