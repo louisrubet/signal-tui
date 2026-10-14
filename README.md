@@ -8,7 +8,7 @@ A Signal client for the terminal, linked to your phone as a secondary device (li
 
 - **Images** shown as thumbnails, pasted with `Ctrl+V`, opened full size with `o`
 - **Link previews** with title, description and image, as Signal sends them
-- **Emojis**: reactions, `:shortcode:` completion
+- **Emojis**: reactions, fuzzy `:shortcode` picker (fzf style)
 - **Replies, forwards, deletion**, `**bold**` `*italic*` `~strikethrough~`
 - **Pinned chats**, unread counts, desktop notifications
 

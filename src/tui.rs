@@ -22,6 +22,7 @@ use crossterm::{
 
 use crate::data::{self, Discussion, Message, Styled};
 use crate::editor::Editor;
+use crate::fuzzy;
 use crate::graphics::Thumbnails;
 use crate::settings::Settings;
 use crate::ui;
@@ -125,13 +126,16 @@ struct Compose {
     completion: Option<Completion>,
 }
 
-/// Emoji completion of the `:shortcode` being typed.
+/// Emoji completion of the `:shortcode` being typed, in a list like fzf's.
 struct Completion {
     /// Byte index of its `:` in the draft.
     start: usize,
-    /// Match under the cursor.
+    /// Match under the cursor, 0 being the best (at the bottom).
     cursor: usize,
 }
+
+/// Matches shown by the completion list.
+const COMPLETION_ROWS: usize = 10;
 
 impl Compose {
     fn new(text: &str, reply_to: Option<usize>) -> Box<Self> {
@@ -160,16 +164,28 @@ impl Compose {
         let Some(filter) = self.completion_filter() else {
             return false;
         };
-        let matches = reaction_matches(&filter);
+        let matches = fuzzy::emoji_matches(&filter);
         let Some(completion) = &mut self.completion else {
             return false;
         };
+        let last = matches.len().saturating_sub(1);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             // Leaves the text as typed, `:` included.
             KeyCode::Esc => self.completion = None,
-            KeyCode::Left => completion.cursor = completion.cursor.saturating_sub(1),
-            KeyCode::Right => {
-                completion.cursor = (completion.cursor + 1).min(matches.len().saturating_sub(1))
+            KeyCode::Char('c' | 'g') if ctrl => self.completion = None,
+            // The best match is at the bottom: up goes to the next ones, as in fzf.
+            KeyCode::Up => completion.cursor = (completion.cursor + 1).min(last),
+            KeyCode::Char('p' | 'k') if ctrl => {
+                completion.cursor = (completion.cursor + 1).min(last)
+            }
+            KeyCode::Down => completion.cursor = completion.cursor.saturating_sub(1),
+            KeyCode::Char('n' | 'j') if ctrl => {
+                completion.cursor = completion.cursor.saturating_sub(1)
+            }
+            KeyCode::PageUp => completion.cursor = (completion.cursor + COMPLETION_ROWS).min(last),
+            KeyCode::PageDown => {
+                completion.cursor = completion.cursor.saturating_sub(COMPLETION_ROWS)
             }
             // Shift/Alt+Enter still adds a line (and ends the completion).
             KeyCode::Enter | KeyCode::Tab
@@ -177,9 +193,9 @@ impl Compose {
                     .modifiers
                     .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
             {
-                if let Some((_, emoji)) = matches.get(completion.cursor) {
+                if let Some(m) = matches.get(completion.cursor) {
                     let start = completion.start;
-                    self.editor.replace_to_cursor(start, emoji);
+                    self.editor.replace_to_cursor(start, m.emoji);
                 }
                 self.completion = None;
             }
@@ -233,25 +249,12 @@ const QUICK_REACTIONS: [&str; 6] = [
     "\u{1f622}",
 ];
 
-/// The reaction picker: shortcode typed so far, and the emoji under the cursor.
+/// The reaction picker: the quick reactions, then once a shortcode is typed its matches
+/// in a list like fzf's, with the one under the cursor (0 being the best, at the bottom).
 #[derive(Default)]
 struct Picker {
     filter: String,
     cursor: usize,
-}
-
-/// Emoji whose shortcode starts with `filter` (an exact shortcode first), one per emoji.
-fn reaction_matches(filter: &str) -> Vec<(&'static str, &'static str)> {
-    let exact = emoji_expander::EMOJIS
-        .get_key_value(filter)
-        .map(|(k, v)| (*k, *v));
-    let mut matches: Vec<(&str, &str)> = Vec::new();
-    for (shortcode, emoji) in exact.into_iter().chain(emoji_expander::search(filter)) {
-        if !matches.iter().any(|(_, e)| *e == emoji) {
-            matches.push((shortcode, emoji));
-        }
-    }
-    matches
 }
 
 /// Without news, someone is no longer shown typing after this (as Signal clients do).
@@ -567,19 +570,49 @@ impl App {
                     let matches = if picker.filter.is_empty() {
                         Vec::new()
                     } else {
-                        reaction_matches(&picker.filter)
+                        fuzzy::emoji_matches(&picker.filter)
                     };
-                    let count = matches.len();
+                    let last = matches.len().saturating_sub(1);
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     let pick = match key.code {
                         KeyCode::Esc => {
+                            *reacting = None;
+                            None
+                        }
+                        KeyCode::Char('c' | 'g') if ctrl => {
                             *reacting = None;
                             None
                         }
                         KeyCode::Char(c @ '1'..='6') if picker.filter.is_empty() => {
                             Some(QUICK_REACTIONS[c as usize - '1' as usize])
                         }
-                        KeyCode::Char(c) if c.is_alphanumeric() || "_+-".contains(c) => {
-                            picker.filter.extend(c.to_lowercase());
+                        // The best match is at the bottom: up goes to the next ones, as in fzf.
+                        KeyCode::Up => {
+                            picker.cursor = (picker.cursor + 1).min(last);
+                            None
+                        }
+                        KeyCode::Char('p' | 'k') if ctrl => {
+                            picker.cursor = (picker.cursor + 1).min(last);
+                            None
+                        }
+                        KeyCode::Down => {
+                            picker.cursor = picker.cursor.saturating_sub(1);
+                            None
+                        }
+                        KeyCode::Char('n' | 'j') if ctrl => {
+                            picker.cursor = picker.cursor.saturating_sub(1);
+                            None
+                        }
+                        KeyCode::PageUp => {
+                            picker.cursor = (picker.cursor + COMPLETION_ROWS).min(last);
+                            None
+                        }
+                        KeyCode::PageDown => {
+                            picker.cursor = picker.cursor.saturating_sub(COMPLETION_ROWS);
+                            None
+                        }
+                        KeyCode::Char(c) if is_shortcode_char(c) && !ctrl => {
+                            picker.filter.push(c.to_ascii_lowercase());
                             picker.cursor = 0;
                             None
                         }
@@ -588,23 +621,9 @@ impl App {
                             picker.cursor = 0;
                             None
                         }
-                        KeyCode::Left => {
-                            picker.cursor = picker.cursor.saturating_sub(1);
-                            None
+                        KeyCode::Enter | KeyCode::Tab => {
+                            matches.get(picker.cursor).map(|m| m.emoji)
                         }
-                        KeyCode::Right => {
-                            picker.cursor = (picker.cursor + 1).min(count.saturating_sub(1));
-                            None
-                        }
-                        KeyCode::Home => {
-                            picker.cursor = 0;
-                            None
-                        }
-                        KeyCode::End => {
-                            picker.cursor = count.saturating_sub(1);
-                            None
-                        }
-                        KeyCode::Enter => matches.get(picker.cursor).map(|(_, emoji)| *emoji),
                         _ => None,
                     };
                     let emoji = pick?;
@@ -1239,82 +1258,67 @@ fn draw_settings(
     Ok(())
 }
 
-/// The picker footer: the quick reactions until a shortcode is typed; then the matches
-/// around the cursor (the one under it in brackets, with its shortcode), position and keys.
-fn picker_line(picker: &Picker, width: usize) -> String {
-    if picker.filter.is_empty() {
-        let quick: Vec<String> = QUICK_REACTIONS
-            .iter()
-            .enumerate()
-            .map(|(i, emoji)| format!("{} {emoji}", i + 1))
-            .collect();
-        return format!(
-            "React: {}   or type a shortcode   Esc cancel",
-            quick.join("  ")
-        );
-    }
-    matches_line(
-        &format!("React :{}  ", picker.filter),
-        &picker.filter,
-        picker.cursor,
-        width,
+/// The picker footer before a shortcode is typed: the quick reactions.
+fn picker_line() -> String {
+    let quick: Vec<String> = QUICK_REACTIONS
+        .iter()
+        .enumerate()
+        .map(|(i, emoji)| format!("{} {emoji}", i + 1))
+        .collect();
+    format!(
+        "React: {}   or type a shortcode   Esc cancel",
+        quick.join("  ")
     )
 }
 
-/// The completion line above the draft while a `:shortcode` is typed.
-fn completion_line(filter: &str, cursor: usize, width: usize) -> String {
-    if filter.is_empty() {
-        return ":  type a shortcode   Esc cancel".to_string();
+/// The completion list above the draft while a `:shortcode` is typed, laid out as fzf
+/// does: `rows` matches with the best at the bottom, the letters typed in bold, then the
+/// count. Also gives the row of the match under `cursor`.
+fn completion_list(
+    filter: &str,
+    cursor: usize,
+    rows: usize,
+) -> (Vec<(String, Vec<Styled>)>, Option<usize>) {
+    let matches = fuzzy::emoji_matches(filter);
+    // The window of matches scrolls to keep the cursor in it.
+    let start = cursor.saturating_sub(rows - 1);
+    let mut lines = Vec::new();
+    let mut highlight = None;
+    for i in (start..start + rows).rev() {
+        let Some(m) = matches.get(i) else {
+            lines.push((String::new(), Vec::new()));
+            continue;
+        };
+        let marker = if i == cursor {
+            highlight = Some(lines.len());
+            "> "
+        } else {
+            "  "
+        };
+        let line = format!("{marker}{} :{}:", m.emoji, m.shortcode);
+        let at = marker.len() + m.emoji.len() + 2;
+        let styles = m
+            .positions
+            .iter()
+            .map(|&p| Styled {
+                start: at + p,
+                end: at + p + 1,
+                style: data::Style::Bold,
+            })
+            .collect();
+        lines.push((line, styles));
     }
-    matches_line(&format!(":{filter}  "), filter, cursor, width)
-}
-
-/// `head`, then the emoji matching `filter` around `cursor` (the one under it in brackets,
-/// with its shortcode), position and keys.
-fn matches_line(head: &str, filter: &str, cursor: usize, width: usize) -> String {
-    let matches = reaction_matches(filter);
-    if matches.is_empty() {
-        return format!("{head}no match   Backspace edit   Esc cancel");
-    }
-    let tail = format!(
-        "  {}/{}  \u{2190}/\u{2192} browse  Enter pick  Esc",
-        cursor + 1,
-        matches.len()
-    );
-    let items: Vec<String> = matches
-        .iter()
-        .enumerate()
-        .map(|(i, (short, emoji))| {
-            // Only the emoji under the cursor shows its shortcode, so that many fit.
-            if i == cursor {
-                format!("[{emoji} {short}]")
-            } else {
-                format!(" {emoji} ")
-            }
-        })
-        .collect();
-
-    // As many emoji as fit around the cursor.
-    let avail = width.saturating_sub(ui::width_of(head) + ui::width_of(&tail));
-    let (mut start, mut end) = (cursor, cursor + 1);
-    let mut used = ui::width_of(&items[cursor]);
-    loop {
-        let mut grew = false;
-        if end < items.len() && used + ui::width_of(&items[end]) <= avail {
-            used += ui::width_of(&items[end]);
-            end += 1;
-            grew = true;
-        }
-        if start > 0 && used + ui::width_of(&items[start - 1]) <= avail {
-            start -= 1;
-            used += ui::width_of(&items[start]);
-            grew = true;
-        }
-        if !grew {
-            break;
-        }
-    }
-    format!("{head}{}{tail}", items[start..end].concat())
+    let count = if matches.is_empty() {
+        "  0/0   no match   Esc cancel".to_string()
+    } else {
+        format!(
+            "  {}/{}   \u{2191}/\u{2193} browse   Enter pick   Esc cancel",
+            cursor + 1,
+            matches.len()
+        )
+    };
+    lines.push((count, Vec::new()));
+    (lines, highlight)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1345,6 +1349,8 @@ fn draw_discussion(
     // Footer: the help/status line, or the compose area with one row per line of the draft
     // (at most half the screen, showing the end of the draft).
     let mut cursor_pos = None;
+    // Footer row shown reversed: the match under the cursor of the completion.
+    let mut highlight = None;
     // Footer rows with their styles (only the draft has some).
     let footer: Vec<(String, Vec<Styled>)> = match composing {
         Some(
@@ -1386,26 +1392,39 @@ fn draw_discussion(
                 })
                 .collect();
             let col = indent.len() + cursor_col - offset;
-            // The completion line goes above the draft.
-            let completion = compose.completion_filter().map(|filter| {
-                (
-                    completion_line(
-                        &filter,
-                        compose.completion.as_ref().map_or(0, |c| c.cursor),
-                        width,
-                    ),
-                    Vec::new(),
-                )
-            });
-            let above = usize::from(completion.is_some());
+            // The completion list goes above the draft, leaving a line of messages.
+            let list_rows = COMPLETION_ROWS.min(height.saturating_sub(HEADER + rows.len() + 2));
+            let completion = match (compose.completion_filter(), &compose.completion) {
+                (Some(filter), Some(completion)) if list_rows > 0 => {
+                    let (lines, at) = completion_list(&filter, completion.cursor, list_rows);
+                    highlight = at;
+                    lines
+                }
+                _ => Vec::new(),
+            };
             cursor_pos = Some((
                 col.min(width.saturating_sub(1)),
-                cursor_line - first + above,
+                cursor_line - first + completion.len(),
             ));
             completion.into_iter().chain(rows).collect()
         }
         None => match reacting {
-            Some(picker) => vec![(picker_line(picker, width), Vec::new())],
+            Some(picker) if picker.filter.is_empty() => vec![(picker_line(), Vec::new())],
+            Some(picker) => {
+                // The list of matches above the shortcode, leaving a line of messages.
+                let rows = COMPLETION_ROWS
+                    .min(height.saturating_sub(HEADER + 2))
+                    .max(1);
+                let (mut lines, at) = completion_list(&picker.filter, picker.cursor, rows);
+                highlight = at;
+                let prompt = format!("React :{}", picker.filter);
+                cursor_pos = Some((
+                    ui::width_of(&prompt).min(width.saturating_sub(1)),
+                    lines.len(),
+                ));
+                lines.push((prompt, Vec::new()));
+                lines
+            }
             None if deleting => {
                 vec![(
                     "Delete this message for everyone?   y yes   any other key: no".to_string(),
@@ -1491,7 +1510,7 @@ fn draw_discussion(
             (footer_y + row) as u16,
             &ui::pad_left(text, width),
             styles,
-            false,
+            highlight == Some(row),
         )?;
     }
     if let Some((col, row)) = cursor_pos {
@@ -1651,8 +1670,20 @@ mod tests {
     fn colon_completes_emoji() {
         let mut app = opened();
         app.handle_key(key(KeyCode::Enter));
-        type_text(&mut app, "go :ro");
-        assert!(screen(&mut app).contains(":ro  [\u{1f916} robot_face]"));
+        type_text(&mut app, "go :rkt");
+        let matches = fuzzy::emoji_matches("rkt");
+        assert_eq!(matches[0].emoji, "\u{1f680}", "fuzzy: rocket");
+        let text = screen(&mut app);
+        assert!(
+            text.contains("> \u{1f680} :rocket:"),
+            "best match under the cursor"
+        );
+        assert!(text.contains(&format!("1/{}", matches.len())));
+        // The next matches are above it, as in fzf.
+        app.handle_key(key(KeyCode::Up));
+        let next = format!("> {} :{}:", matches[1].emoji, matches[1].shortcode);
+        assert!(screen(&mut app).contains(&next));
+        app.handle_key(key(KeyCode::Down));
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             None,
@@ -1664,7 +1695,7 @@ mod tests {
             send,
             Some(Action::Send {
                 discussion: 0,
-                text: "go \u{1f916} now".to_string(),
+                text: "go \u{1f680} now".to_string(),
                 styles: vec![],
                 reply_to: None
             })
@@ -1698,14 +1729,11 @@ mod tests {
         let mut app = opened();
         app.handle_key(key(KeyCode::Enter));
         type_text(&mut app, "at 10:30");
-        assert!(!screen(&mut app).contains("type a shortcode"));
+        assert!(!screen(&mut app).contains("Enter pick"));
         type_text(&mut app, " :");
-        assert!(screen(&mut app).contains("type a shortcode"));
+        assert!(screen(&mut app).contains("Enter pick"), "all emoji listed");
         type_text(&mut app, " ok");
-        assert!(
-            !screen(&mut app).contains("type a shortcode"),
-            "a space ends it"
-        );
+        assert!(!screen(&mut app).contains("Enter pick"), "a space ends it");
     }
 
     #[test]
@@ -2136,7 +2164,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('e')));
         type_text(&mut app, "rocket");
-        assert!(screen(&mut app).contains("\u{1f680} rocket"));
+        assert!(screen(&mut app).contains("> \u{1f680} :rocket:"));
         let react = app.handle_key(key(KeyCode::Enter));
         assert_eq!(
             react,
@@ -2168,48 +2196,36 @@ mod tests {
         let mut app = selected();
         let last = app.discussions[0].messages.len() - 1;
         app.handle_key(key(KeyCode::Char('e')));
-        app.handle_key(key(KeyCode::Right));
+        app.handle_key(key(KeyCode::Up));
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             None,
             "no browsing before a shortcode is typed"
         );
 
-        let matches = reaction_matches("s");
+        let matches = fuzzy::emoji_matches("sm");
+        assert!(matches.len() > 50, "every match: {}", matches.len());
+        type_text(&mut app, "sm");
+        let text = screen(&mut app);
+        assert!(text.contains(&format!("1/{}", matches.len())));
         assert!(
-            matches.len() > 50,
-            "every match, not a few: {}",
-            matches.len()
+            text.contains("React :sm"),
+            "the list goes above the shortcode"
         );
-        type_text(&mut app, "s");
-        assert!(screen(&mut app).contains(&format!("1/{}", matches.len())));
+        // The next matches are above the best one, as in fzf.
         for _ in 0..7 {
-            app.handle_key(key(KeyCode::Right));
+            app.handle_key(key(KeyCode::Up));
         }
-        app.handle_key(key(KeyCode::Left));
-        assert!(screen(&mut app).contains(&format!("[{} {}]", matches[6].1, matches[6].0)));
+        app.handle_key(key(KeyCode::Down));
+        let line = format!("> {} :{}:", matches[6].emoji, matches[6].shortcode);
+        assert!(screen(&mut app).contains(&line));
         let react = app.handle_key(key(KeyCode::Enter));
         assert_eq!(
             react,
             Some(Action::React {
                 discussion: 0,
                 msg: last,
-                emoji: matches[6].1.to_string(),
-                remove: false
-            })
-        );
-
-        app.handle_key(key(KeyCode::Char('e')));
-        type_text(&mut app, "s");
-        app.handle_key(key(KeyCode::End));
-        let react = app.handle_key(key(KeyCode::Enter));
-        let emoji = matches[matches.len() - 1].1.to_string();
-        assert_eq!(
-            react,
-            Some(Action::React {
-                discussion: 0,
-                msg: last,
-                emoji,
+                emoji: matches[6].emoji.to_string(),
                 remove: false
             })
         );

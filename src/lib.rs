@@ -1,5 +1,6 @@
 pub mod data;
 pub mod editor;
+pub mod fuzzy;
 pub mod graphics;
 pub mod qr;
 pub mod settings;
