@@ -8,22 +8,19 @@
 
 use std::collections::HashSet;
 use std::error::Error;
-use std::io::{Write, stdout};
+use std::future::Future;
 use std::path::Path;
 use std::pin::pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crossterm::event::{Event, EventStream};
-use crossterm::terminal;
+use chat_tui::backend::Result as BackendResult;
+use chat_tui::data::{ChatId, Discussion, Message};
+use chat_tui::{Backend, Capabilities, Downloaded, Draft, Event, qr};
 use futures::StreamExt;
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use presage::model::messages::Received;
 use presage_store_sqlite::SqliteStore;
-use signal_tui::data::{self, Discussion};
-use signal_tui::graphics::Thumbnails;
-use signal_tui::qr;
-use signal_tui::settings::Settings;
-use signal_tui::signal::{self, Directory, Pins, ReadMarks, Thread};
-use signal_tui::tui::{Action, App, TerminalGuard};
+use signal_tui::signal::{self, Directory, SignalManager, Thread};
 
 const USAGE: &str = "usage: signal-tui [--reset | --version]";
 const DEVICE_NAME: &str = "signal-tui";
@@ -72,12 +69,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
 /// Links or loads the account from `store` (at `path`), syncs, then runs the interface.
 async fn chat(store: SqliteStore, path: &Path) -> Result<(), Box<dyn Error>> {
-    let (mut manager, linked) = signal::link_or_load(store, DEVICE_NAME, |url| {
+    let (manager, linked) = signal::link_or_load(store, DEVICE_NAME, |url| {
         println!("Scan this QR code from Signal on your phone (Settings > Linked devices):");
         qr::print_qr(url.as_str());
         println!("Or use the URL: {url}");
     })
     .await?;
+    let mut manager = manager;
 
     eprintln!("Syncing\u{2026}");
     // Right after linking, give the phone time to send the contacts.
@@ -85,288 +83,178 @@ async fn chat(store: SqliteStore, path: &Path) -> Result<(), Box<dyn Error>> {
     let seen = signal::sync(&mut manager, contacts_timeout).await?;
     let conversations = signal::conversations(&manager, seen).await?;
     let directory = Directory::load(&manager).await?;
-    let (mut threads, mut discussions) =
-        signal::load_discussions(&manager, &directory, &conversations).await?;
-    let mut read_marks = ReadMarks::load(path.with_extension("read"));
-    let mut pins = Pins::load(path.with_extension("pinned"));
-    for (thread, discussion) in threads.iter().zip(&mut discussions) {
-        discussion.unread = read_marks.unread_count(thread, discussion);
-        discussion.pinned = pins.rank(thread);
-    }
-    let mut app = App::new(discussions);
-    let settings_path = Settings::default_path()?;
-    app.settings = Settings::load(&settings_path);
-    app.thumbnails = Thumbnails::detect();
+    let discussions = signal::load_discussions(&manager, &directory, &conversations).await?;
 
-    // Messages arriving while the interface runs, on a clone so `manager` stays free to send.
-    let mut receiver = manager.clone();
-    let mut incoming = pin!(receiver.receive_messages().await?);
-    let mut incoming_open = true;
-    // Images of the history, downloaded in the background for their thumbnails.
-    let (fetched_tx, mut fetched) = futures::channel::mpsc::unbounded();
-    let mut history_fetched = HashSet::new();
-
-    let _terminal = TerminalGuard::enter()?;
-    let mut keys = EventStream::new();
-    let mut out = stdout();
-    loop {
-        let (w, h) = terminal::size()?;
-        app.draw(&mut out, w, h)?;
-        out.flush()?;
-
-        let typing_expiry = app.next_typing_expiry();
-        tokio::select! {
-            _ = tokio::time::sleep_until(typing_expiry.unwrap_or_else(Instant::now).into()), if typing_expiry.is_some() => {
-                app.expire_typing(Instant::now());
-            }
-            event = keys.next() => {
-                let Some(event) = event else { break };
-                let action = match event? {
-                    Event::Key(key) => app.handle_key(key),
-                    Event::Paste(text) => {
-                        app.handle_paste(&text);
-                        None
-                    }
-                    _ => None,
-                };
-                let Some(action) = action else { continue };
-
-                let (discussion, text, styles, attachments, reply_to, forwarded) = match action {
-                    Action::Quit => break,
-                    Action::React { discussion, msg, emoji, remove } => {
-                        let target = &app.discussions[discussion].messages[msg];
-                        match signal::react(&mut manager, &threads[discussion], target, &emoji, remove).await {
-                            Ok(update) => {
-                                update.apply(&mut app.discussions[discussion]);
-                            }
-                            Err(e) => app.set_status(format!("Reaction failed: {e}")),
-                        }
-                        continue;
-                    }
-                    Action::Delete { discussion, msg } => {
-                        let target = &app.discussions[discussion].messages[msg];
-                        match signal::delete(&mut manager, &threads[discussion], target).await {
-                            Ok(()) => app.discussions[discussion].messages[msg].mark_deleted(),
-                            Err(e) => app.set_status(format!("Deletion failed: {e}")),
-                        }
-                        continue;
-                    }
-                    Action::PasteImageFromClipboard => {
-                        if let Some(attachment) = data::Attachment::from_clipboard() {
-                            app.handle_pasted_image(attachment);
-                        } else {
-                            app.set_status("No image in the clipboard");
-                        }
-                        continue;
-                    }
-                    Action::FetchAttachments { discussion, msg } => {
-                        app.set_status("Downloading\u{2026}");
-                        app.draw(&mut out, w, h)?;
-                        out.flush()?;
-                        let id = app.discussions[discussion].messages[msg].id;
-                        match signal::download_attachments(&manager, &threads[discussion], id).await {
-                            Ok((attachments, images)) => {
-                                app.discussions[discussion].messages[msg].set_downloaded(attachments, images);
-                                app.open_selection();
-                            }
-                            Err(e) => {
-                                app.discussions[discussion].messages[msg].download_failed = true;
-                                app.set_status(format!("Download failed: {e}"));
-                            }
-                        }
-                        continue;
-                    }
-                    Action::PinToggled(idx) => {
-                        if let Err(e) = pins.set(&threads[idx], app.discussions[idx].pinned.is_some()) {
-                            app.set_status(format!("Cannot save the pinned chats: {e}"));
-                        }
-                        continue;
-                    }
-                    Action::SettingsChanged => {
-                        if let Err(e) = app.settings.save(&settings_path) {
-                            app.set_status(format!("Cannot save the parameters: {e}"));
-                        }
-                        continue;
-                    }
-                    Action::Opened(idx) => {
-                        if let Err(e) = read_marks.mark_read(&threads[idx], &app.discussions[idx]) {
-                            app.set_status(format!("Cannot save the read state: {e}"));
-                        }
-                        if app.thumbnails.enabled() && history_fetched.insert(idx) {
-                            fetch_history_images(&manager, &threads[idx], idx, &app.discussions[idx], &fetched_tx);
-                        }
-                        continue;
-                    }
-                    Action::Send { discussion, text, styles, reply_to } => (discussion, text, styles, Vec::new(), reply_to, false),
-                    Action::SendWithAttachments { discussion, text, attachments, reply_to } => {
-                        (discussion, text, Vec::new(), attachments, reply_to, false)
-                    }
-                    Action::Forward { from, msg, to } => {
-                        let message = &app.discussions[from].messages[msg];
-                        (to, message.text.clone(), message.styles.clone(), Vec::new(), None, true)
-                    }
-                };
-                app.set_status("Sending\u{2026}");
-                app.draw(&mut out, w, h)?;
-                out.flush()?;
-
-                let quote = reply_to.map(|i| (i, &app.discussions[discussion].messages[i]));
-                match signal::send(&mut manager, &threads[discussion], &text, &styles, attachments, quote).await {
-                    Ok(mut message) => {
-                        message.forwarded = forwarded;
-                        app.push_message(discussion, message);
-                        if forwarded {
-                            app.set_status(format!("Forwarded to {}", app.discussions[discussion].title));
-                        } else {
-                            app.set_status("Sent");
-                        }
-                    }
-                    Err(e) => app.set_status(format!("Sending failed: {e}")),
-                }
-            }
-            Some((idx, id, downloaded)) = fetched.next() => {
-                if let Some(message) = app.discussions[idx]
-                    .messages
-                    .iter_mut()
-                    .find(|m| m.id == id && m.needs_download())
-                {
-                    match downloaded {
-                        Some((attachments, images)) => message.set_downloaded(attachments, images),
-                        None => message.download_failed = true,
-                    }
-                }
-            }
-            received = incoming.next(), if incoming_open => {
-                let Some(received) = received else {
-                    incoming_open = false;
-                    app.set_status("Disconnected from Signal: restart to receive new messages");
-                    continue;
-                };
-                let Received::Content(content) = received else { continue };
-                if let Some(typing) = directory.typing(&content) {
-                    if let Some(idx) = threads.iter().position(|t| *t == typing.thread) {
-                        app.set_typing(idx, &typing.author, &typing.name, typing.started, Instant::now());
-                    }
-                    continue;
-                }
-                let Ok(thread) = Thread::try_from(&*content) else { continue };
-                if let Some((target, author)) = directory.deletion(&content) {
-                    // Only its author can delete a message.
-                    if let Some(idx) = threads.iter().position(|t| *t == thread)
-                        && let Some(message) =
-                            app.discussions[idx].messages.iter_mut().find(|m| m.id == target && m.author.as_ref() == Some(&author))
-                    {
-                        message.mark_deleted();
-                    }
-                    continue;
-                }
-                if let Some(reaction) = directory.reaction(&content) {
-                    if let Some(idx) = threads.iter().position(|t| *t == thread) {
-                        reaction.apply(&mut app.discussions[idx]);
-                    }
-                    continue;
-                }
-                let is_group = matches!(thread, Thread::Group(_));
-                if directory.to_message(&content).is_none() {
-                    continue;
-                }
-                let idx = match threads.iter().position(|t| *t == thread) {
-                    Some(idx) => idx,
-                    None => {
-                        // A conversation we did not list yet (e.g. someone not in the contacts).
-                        let title = signal::thread_title(&manager, &thread).await.unwrap_or_else(|_| thread.to_string());
-                        threads.push(thread);
-                        app.push_discussion(Discussion::new(title))
-                    }
-                };
-                if let Some(mut message) = directory.resolve(&app.discussions[idx], &content) {
-                    // Images only: videos and files can be big, they wait for `o`.
-                    if message.needs_download() && message.images_only() {
-                        match signal::download_content_attachments(&manager, &content).await {
-                            Ok((attachments, images)) => message.set_downloaded(attachments, images),
-                            Err(_) => message.download_failed = true,
-                        }
-                    }
-                    if app.settings.notifications && !message.from_me && !app.is_open(idx) {
-                        notify(&app.discussions[idx], &message.sender_name, &message.summary(), is_group);
-                    }
-                    app.push_message(idx, message);
-                    // Arrived in the discussion being read: no star on the next start.
-                    if app.is_open(idx) && let Err(e) = read_marks.mark_read(&threads[idx], &app.discussions[idx]) {
-                        app.set_status(format!("Cannot save the read state: {e}"));
-                    }
-                }
-            }
-        }
-    }
-    let _ = app.thumbnails.clear(&mut out);
+    let known = discussions.iter().map(|d| d.id.clone()).collect();
+    let events = receive(manager.clone(), directory, known);
+    // The read marks and pins stay next to the store, where earlier versions kept them.
+    let mut config = chat_tui::Config::new(DEVICE_NAME)?;
+    config.read_marks = path.with_extension("read");
+    config.pins = path.with_extension("pinned");
+    chat_tui::run(Signal { manager }, discussions, events, config).await?;
     Ok(())
 }
 
-/// Downloads in the background, newest first, the history images of `discussion` (number
-/// `idx`, in `thread`), with the images of the link previews, sent to `fetched` as they
-/// come. Messages with other attachments (videos, files…) are left for `o`.
-fn fetch_history_images(
-    manager: &signal::SignalManager,
-    thread: &Thread,
-    idx: usize,
-    discussion: &Discussion,
-    fetched: &Fetched,
-) {
-    let ids: Vec<u64> = discussion
-        .messages
-        .iter()
-        .rev()
-        .filter(|m| m.needs_download() && m.images_only())
-        .map(|m| m.id)
-        .collect();
-    if ids.is_empty() {
-        return;
+/// Signal, for the interface.
+struct Signal {
+    manager: SignalManager,
+}
+
+/// The futures own a clone of the manager: they are `'static`, as the trait wants.
+#[allow(clippy::manual_async_fn)]
+impl Backend for Signal {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            delete_max_age: Some(Duration::from_millis(signal::DELETE_MAX_AGE_MS)),
+        }
     }
-    let (manager, thread, fetched) = (manager.clone(), thread.clone(), fetched.clone());
+
+    fn send(
+        &self,
+        chat: &ChatId,
+        draft: Draft,
+    ) -> impl Future<Output = BackendResult<Message>> + 'static {
+        let (mut manager, thread) = (self.manager.clone(), signal::thread_of(chat));
+        async move {
+            let thread = thread.ok_or("unknown chat")?;
+            let quote = draft.reply_to.as_ref();
+            Ok(signal::send(
+                &mut manager,
+                &thread,
+                &draft.text,
+                &draft.styles,
+                draft.attachments,
+                quote,
+            )
+            .await?)
+        }
+    }
+
+    fn react(
+        &self,
+        chat: &ChatId,
+        message: &Message,
+        emoji: &str,
+        remove: bool,
+    ) -> impl Future<Output = BackendResult<()>> + 'static {
+        let (mut manager, thread) = (self.manager.clone(), signal::thread_of(chat));
+        let (message, emoji) = (message.clone(), emoji.to_string());
+        async move {
+            let thread = thread.ok_or("unknown chat")?;
+            signal::react(&mut manager, &thread, &message, &emoji, remove).await?;
+            Ok(())
+        }
+    }
+
+    fn delete(
+        &self,
+        chat: &ChatId,
+        message: &Message,
+    ) -> impl Future<Output = BackendResult<()>> + 'static {
+        let (mut manager, thread) = (self.manager.clone(), signal::thread_of(chat));
+        let message = message.clone();
+        async move {
+            let thread = thread.ok_or("unknown chat")?;
+            Ok(signal::delete(&mut manager, &thread, &message).await?)
+        }
+    }
+
+    fn download(
+        &self,
+        chat: &ChatId,
+        message: &Message,
+    ) -> impl Future<Output = BackendResult<Downloaded>> + 'static {
+        let (manager, thread) = (self.manager.clone(), signal::thread_of(chat));
+        let id = signal::signal_id(message);
+        async move {
+            let thread = thread.ok_or("unknown chat")?;
+            Ok(signal::download_attachments(&manager, &thread, id).await?)
+        }
+    }
+}
+
+/// What arrives from Signal while the interface runs, as interface events. `known`: the
+/// chats already listed. Ends when the connection is lost.
+fn receive(
+    mut manager: SignalManager,
+    directory: Directory,
+    mut known: HashSet<ChatId>,
+) -> UnboundedReceiver<Event> {
+    let (events, received) = unbounded();
+    // Receiving borrows `manager`: downloads and titles go through clones.
+    let other = manager.clone();
     tokio::task::spawn_local(async move {
-        for id in ids {
-            let downloaded = signal::download_attachments(&manager, &thread, id)
-                .await
-                .ok();
-            if fetched.unbounded_send((idx, id, downloaded)).is_err() {
+        let incoming = match manager.receive_messages().await {
+            Ok(incoming) => incoming,
+            Err(e) => {
+                let _ =
+                    events.unbounded_send(Event::Status(format!("Cannot receive messages: {e}")));
+                return;
+            }
+        };
+        let mut incoming = pin!(incoming);
+        while let Some(received) = incoming.next().await {
+            let Received::Content(content) = received else {
+                continue;
+            };
+            let event = if let Some(typing) = directory.typing(&content) {
+                Event::Typing {
+                    chat: signal::thread_key(&typing.thread),
+                    author: typing.author,
+                    name: typing.name,
+                    started: typing.started,
+                }
+            } else {
+                let Ok(thread) = Thread::try_from(&*content) else {
+                    continue;
+                };
+                let chat = signal::thread_key(&thread);
+                if let Some((target, author)) = directory.deletion(&content) {
+                    Event::Deleted {
+                        chat,
+                        target: target.to_string(),
+                        author,
+                    }
+                } else if let Some(reaction) = directory.reaction(&content) {
+                    Event::Reaction {
+                        chat,
+                        target: reaction.target_id.to_string(),
+                        author: reaction.author,
+                        mine: reaction.mine,
+                        emoji: reaction.emoji,
+                    }
+                } else if let Some((mut message, quote)) = directory.to_message(&content) {
+                    if known.insert(chat.clone()) {
+                        // A conversation not listed yet (e.g. someone not in the contacts).
+                        let title = signal::thread_title(&other, &thread)
+                            .await
+                            .unwrap_or_else(|_| thread.to_string());
+                        let mut discussion = Discussion::new(chat.clone(), title);
+                        discussion.is_group = matches!(thread, Thread::Group(_));
+                        let _ = events.unbounded_send(Event::Chat(discussion));
+                    }
+                    // Images only: videos and files can be big, they wait for `o`.
+                    if message.needs_download() && message.images_only() {
+                        match signal::download_content_attachments(&other, &content).await {
+                            Ok((attachments, images)) => {
+                                message.set_downloaded(attachments, images)
+                            }
+                            Err(_) => message.download_failed = true,
+                        }
+                    }
+                    Event::Message {
+                        chat,
+                        message,
+                        quote: quote.map(|id| id.to_string()),
+                    }
+                } else {
+                    continue;
+                }
+            };
+            if events.unbounded_send(event).is_err() {
                 break;
             }
         }
     });
-}
-
-/// Where the downloaded history images go: (discussion, message id, what was downloaded,
-/// `None` when it failed).
-type Fetched = futures::channel::mpsc::UnboundedSender<(usize, u64, Option<signal::Downloaded>)>;
-
-/// Desktop notification for a received message: the conversation as title, the text as body
-/// (prefixed by the sender in groups).
-fn notify(discussion: &Discussion, sender_name: &str, text: &str, is_group: bool) {
-    let summary = discussion.title.clone();
-    let body = if is_group {
-        format!("{sender_name}: {text}")
-    } else {
-        text.to_string()
-    };
-    // Notification servers block on D-Bus / OS calls: keep them off the event loop.
-    // Failures (no notification server…) are not worth interrupting the user for.
-    tokio::task::spawn_blocking(move || {
-        let _ = notify_rust::Notification::new()
-            .appname("signal-tui")
-            .summary(&summary)
-            .body(&escape_markup(&body))
-            .show();
-    });
-}
-
-/// The freedesktop notification body is markup: `<`, `>` and `&` must be escaped there.
-fn escape_markup(text: &str) -> String {
-    if cfg!(all(unix, not(target_os = "macos"))) {
-        text.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    } else {
-        text.to_string()
-    }
+    received
 }

@@ -12,7 +12,8 @@
 
 use std::time::Duration;
 
-use signal_tui::{qr, signal};
+use chat_tui::qr;
+use signal_tui::signal;
 
 fn main() {
     let runtime = tokio::runtime::Builder::new_current_thread()

@@ -532,6 +532,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat-tui"
+version = "0.1.0"
+source = "git+https://github.com/louisrubet/chat-tui?tag=v0.1.0#3ee74f5af829b9bdf964b3c4b541f5361442b221"
+dependencies = [
+ "arboard",
+ "base64 0.22.1",
+ "chrono",
+ "crossterm",
+ "emoji-expander",
+ "futures",
+ "image",
+ "notify-rust",
+ "open",
+ "qrcode",
+ "rand 0.9.5",
+ "tokio",
+ "unicode-width",
+ "url",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3758,26 +3779,18 @@ dependencies = [
 name = "signal-tui"
 version = "1.3.2"
 dependencies = [
- "arboard",
- "base64 0.22.1",
+ "chat-tui",
  "chrono",
- "crossterm",
- "emoji-expander",
  "futures",
- "image",
  "keyring",
  "libc",
- "notify-rust",
- "open",
  "presage",
  "presage-store-sqlite",
- "qrcode",
  "rand 0.9.5",
  "rpassword",
  "sqlx",
  "tempfile",
  "tokio",
- "unicode-width",
  "url",
 ]
 

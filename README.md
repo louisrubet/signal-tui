@@ -2,7 +2,7 @@
 
 Running `signal` from your terminal.
 
-A Signal client for the terminal, linked to your phone as a secondary device (like Signal Desktop). Built on [presage](https://github.com/whisperfish/presage).
+A Signal client for the terminal, linked to your phone as a secondary device (like Signal Desktop). Built on [presage](https://github.com/whisperfish/presage) and [chat-tui](https://github.com/louisrubet/chat-tui), the interface it shares with google-messages-tui.
 
 ![A chat with photos, link previews, emojis and reactions](docs/screenshots/chat.png)
 
@@ -12,7 +12,7 @@ A Signal client for the terminal, linked to your phone as a secondary device (li
 - **Replies, forwards, deletion**, `**bold**` `*italic*` `~strikethrough~`
 - **Pinned chats**, unread counts, desktop notifications
 
-<sub>Photos: Wikimedia Commons, CC BY-SA, credits in [examples/demo](examples/demo/README.md).</sub>
+<sub>Photos: Wikimedia Commons, CC BY-SA, credits in [chat-tui](https://github.com/louisrubet/chat-tui/blob/main/examples/demo/README.md).</sub>
 
 ## Install
 
@@ -75,6 +75,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 - **No history.** Signal doesn't send past messages to linked devices. You only see messages received since linking.
 - **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.
 - **Store**: `~/.local/share/signal-tui/`, override with `SIGNAL_TUI_DB`. See [Security](#security).
+- **Interface**: [chat-tui](https://github.com/louisrubet/chat-tui), pinned by tag in `Cargo.toml`; its demo with fake chats is `cargo run --example mock_tui` there.
 - **presage fork**: [louisrubet/presage](https://github.com/louisrubet/presage/tree/storage-groups) adds group sync from the Storage Service.
 
 ## Security
@@ -92,7 +93,6 @@ The store holds everything this linked device needs: its identity keys and crede
 ## Dev
 
 ```sh
-cargo run --example mock_tui      # the UI with fake chats, no Signal (`-- --open`: first chat)
 cargo run --example link_device   # link, then print chats as text
 cargo test                        # add `-- --ignored` for the network test
 ```

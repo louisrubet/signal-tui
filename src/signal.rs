@@ -33,7 +33,10 @@ use presage_store_sqlite::{SqliteStore, SqliteStoreError};
 use tokio::time::Instant;
 use url::Url;
 
-use crate::data::{Attachment, DELETE_MAX_AGE_MS, Discussion, LinkPreview, Message, Style, Styled};
+use chat_tui::data::{Attachment, Discussion, LinkPreview, Message, Style, Styled};
+
+/// How long after sending a message can be deleted for everyone (Signal's limit).
+pub const DELETE_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub type SignalError = presage::Error<SqliteStoreError>;
 pub type SignalManager = Manager<SqliteStore, Registered>;
@@ -344,7 +347,7 @@ pub struct ReactionUpdate {
 impl ReactionUpdate {
     /// Applies it to the message of `discussion` it targets, if that message is there.
     pub fn apply(&self, discussion: &mut Discussion) -> bool {
-        let Some(idx) = discussion.position_of(self.target_id) else {
+        let Some(idx) = discussion.position_of(&self.target_id.to_string()) else {
             return false;
         };
         discussion.messages[idx].set_reaction(&self.author, self.mine, self.emoji.as_deref());
@@ -459,7 +462,8 @@ impl Directory {
         let sender_name = self.name_of(&sender);
         let styles = from_body_ranges(&text, &data.body_ranges);
         let message = Message {
-            id,
+            id: id.to_string(),
+            sent_ms: id,
             author: Some(if from_me { self.own_aci } else { sender }.to_string()),
             from_me,
             sender_name,
@@ -509,7 +513,7 @@ impl Directory {
     /// The message in `content` (if any), with its quote resolved against `discussion`.
     pub fn resolve(&self, discussion: &Discussion, content: &Content) -> Option<Message> {
         let (mut message, quote) = self.to_message(content)?;
-        message.reply_to = quote.and_then(|id| discussion.position_of(id));
+        message.reply_to = quote.and_then(|id| discussion.position_of(&id.to_string()));
         Some(message)
     }
 }
@@ -583,114 +587,42 @@ pub async fn download_content_attachments(
     Ok((attachments, images))
 }
 
-/// When each conversation was last read, kept in a small text file next to the store:
-/// one `<conversation> <id of the newest message read>` per line.
-pub struct ReadMarks {
-    path: PathBuf,
-    marks: HashMap<String, u64>,
-}
-
-impl ReadMarks {
-    /// Loads the marks; a missing file means nothing was read yet.
-    pub fn load(path: PathBuf) -> Self {
-        let marks = std::fs::read_to_string(&path)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| {
-                let (key, id) = line.split_once(' ')?;
-                Some((key.to_string(), id.parse().ok()?))
-            })
-            .collect();
-        ReadMarks { path, marks }
-    }
-
-    /// Number of messages of `discussion` received after it was last read.
-    pub fn unread_count(&self, thread: &Thread, discussion: &Discussion) -> usize {
-        let last_read = self.marks.get(&thread_key(thread)).copied().unwrap_or(0);
-        discussion
-            .messages
-            .iter()
-            .filter(|m| !m.from_me && m.id > last_read)
-            .count()
-    }
-
-    /// Records that every message of `discussion` is read, and saves.
-    pub fn mark_read(&mut self, thread: &Thread, discussion: &Discussion) -> std::io::Result<()> {
-        let Some(newest) = discussion.messages.iter().map(|m| m.id).max() else {
-            return Ok(());
-        };
-        let mark = self.marks.entry(thread_key(thread)).or_default();
-        if *mark >= newest {
-            return Ok(());
-        }
-        *mark = newest;
-        let content: String = self
-            .marks
-            .iter()
-            .map(|(key, id)| format!("{key} {id}\n"))
-            .collect();
-        std::fs::write(&self.path, content)
-    }
-}
-
-/// The pinned conversations, in pin order, kept in a small text file next to the store:
-/// one per line.
-pub struct Pins {
-    path: PathBuf,
-    keys: Vec<String>,
-}
-
-impl Pins {
-    /// Loads the pins; a missing file means nothing is pinned.
-    pub fn load(path: PathBuf) -> Self {
-        let keys = std::fs::read_to_string(&path)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect();
-        Pins { path, keys }
-    }
-
-    /// Rank of `thread` in the pinned list, if pinned.
-    pub fn rank(&self, thread: &Thread) -> Option<u32> {
-        let key = thread_key(thread);
-        self.keys
-            .iter()
-            .position(|k| *k == key)
-            .map(|rank| rank as u32)
-    }
-
-    /// Pins `thread` at the end of the list, or unpins it, and saves.
-    pub fn set(&mut self, thread: &Thread, pinned: bool) -> std::io::Result<()> {
-        let key = thread_key(thread);
-        self.keys.retain(|k| *k != key);
-        if pinned {
-            self.keys.push(key);
-        }
-        let content: String = self.keys.iter().map(|key| format!("{key}\n")).collect();
-        std::fs::write(&self.path, content)
-    }
-}
-
-/// Stable text key of a conversation.
-fn thread_key(thread: &Thread) -> String {
+/// Stable text key of a conversation: its chat id in the interface.
+pub fn thread_key(thread: &Thread) -> String {
     match thread {
         Thread::Contact(id) => id.service_id_string(),
         Thread::Group(key) => key.iter().map(|b| format!("{b:02x}")).collect(),
     }
 }
 
+/// The conversation of a [`thread_key`].
+pub fn thread_of(key: &str) -> Option<Thread> {
+    if key.len() == 64 {
+        let mut master_key = [0; 32];
+        for (i, byte) in master_key.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(key.get(2 * i..2 * i + 2)?, 16).ok()?;
+        }
+        return Some(Thread::Group(master_key));
+    }
+    ServiceId::parse_from_service_id_string(key).map(Thread::Contact)
+}
+
+/// The Signal id of `message`: its sender's timestamp.
+pub fn signal_id(message: &Message) -> u64 {
+    message.id.parse().unwrap_or(message.sent_ms)
+}
+
 /// Builds the interface discussions for `conversations`, with their stored messages.
-/// The threads are returned in the same order, to know where to send.
 pub async fn load_discussions(
     manager: &SignalManager,
     directory: &Directory,
     conversations: &[Conversation],
-) -> Result<(Vec<Thread>, Vec<Discussion>), SqliteStoreError> {
-    let mut threads = Vec::new();
+) -> Result<Vec<Discussion>, SqliteStoreError> {
     let mut discussions = Vec::new();
     for conversation in conversations {
-        let mut discussion = Discussion::new(conversation.title.clone());
+        let mut discussion =
+            Discussion::new(thread_key(&conversation.thread), conversation.title.clone());
+        discussion.is_group = matches!(conversation.thread, Thread::Group(_));
         let mut contents: Vec<Content> = manager
             .store()
             .messages(&conversation.thread, ..)
@@ -708,10 +640,9 @@ pub async fn load_discussions(
                 }
             }
         }
-        threads.push(conversation.thread.clone());
         discussions.push(discussion);
     }
-    Ok((threads, discussions))
+    Ok(discussions)
 }
 
 /// Byte offset in `text` of the UTF-16 offset `utf16` (Signal counts in UTF-16 units).
@@ -779,7 +710,7 @@ pub async fn send(
     text: &str,
     styles: &[Styled],
     attachments: Vec<Attachment>,
-    quote: Option<(usize, &Message)>,
+    quote: Option<&Message>,
 ) -> Result<Message, SignalError> {
     let timestamp = Utc::now().timestamp_millis() as u64;
     let local_attachments = attachments.clone();
@@ -788,8 +719,8 @@ pub async fn send(
         body: (!text.is_empty()).then(|| text.to_string()),
         body_ranges: to_body_ranges(text, styles),
         attachments: attachment_pointers,
-        quote: quote.map(|(_, q)| Quote {
-            id: Some(q.id),
+        quote: quote.map(|q| Quote {
+            id: Some(signal_id(q)),
             author_aci: q.author.clone(),
             text: Some(q.text.clone()),
             ..Default::default()
@@ -797,7 +728,8 @@ pub async fn send(
         ..Default::default()
     };
     send_data_message(manager, thread, message, timestamp).await?;
-    let mut sent = Message::mine(timestamp, text.to_string(), quote.map(|(i, _)| i), false);
+    let mut sent = Message::mine(timestamp, text.to_string(), None, false);
+    sent.sent_ms = timestamp;
     sent.author = Some(own_aci(manager));
     sent.styles = styles.to_vec();
     sent.attachments = local_attachments;
@@ -847,14 +779,14 @@ pub async fn react(
             emoji: Some(emoji.to_string()),
             remove: Some(remove),
             target_author_aci: target.author.clone(),
-            target_sent_timestamp: Some(target.id),
+            target_sent_timestamp: Some(signal_id(target)),
             ..Default::default()
         }),
         ..Default::default()
     };
     send_data_message(manager, thread, message, timestamp).await?;
     Ok(ReactionUpdate {
-        target_id: target.id,
+        target_id: signal_id(target),
         author: own_aci(manager),
         mine: true,
         emoji: (!remove).then(|| emoji.to_string()),
@@ -870,7 +802,7 @@ pub async fn delete(
     let timestamp = Utc::now().timestamp_millis() as u64;
     let message = DataMessage {
         delete: Some(Delete {
-            target_sent_timestamp: Some(target.id),
+            target_sent_timestamp: Some(signal_id(target)),
         }),
         ..Default::default()
     };
