@@ -6,7 +6,8 @@ license = "AGPL-3.0-only"
 build = "build.rs"
 
 [dependencies]
-crossterm = { version = "0.28", features = ["event-stream"] }
+# The interface, shared with google-messages-tui.
+chat-tui = { git = "https://github.com/louisrubet/chat-tui", tag = "v0.1.0" }
 chrono = "0.4"
 futures = "0.3"
 # Fork of whisperfish/presage, branch storage-groups: adds Manager::sync_groups_from_storage_service.
@@ -14,21 +15,12 @@ presage = { git = "https://github.com/louisrubet/presage", rev = "2fc7af9c3b9c5e
 presage-store-sqlite = { git = "https://github.com/louisrubet/presage", rev = "2fc7af9c3b9c5e2baacd60784a450d352daa2fc7" }
 tokio = { version = "1.48", features = ["macros", "rt", "time"] }
 url = "2.5"
-base64 = "0.22"
-open = "5.3"
-notify-rust = "4.18"
-unicode-width = "0.2"
 # Store encryption: key in the OS keyring, passphrase prompt as a fallback.
 keyring = "4.2"
 rpassword = "7.5"
 rand = "0.9"
 # Same sqlx (and SQLCipher) as presage-store-sqlite, to encrypt an existing plain store.
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
-# :shortcode: to emoji table (tip of main).
-emoji-expander = { git = "https://github.com/louisrubet/emoji-expander", tag = "v1.2.0" }
-qrcode = { version = "0.14", default-features = false }
-arboard = { version = "3.6.1", features = ["wayland-data-control"] }
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
