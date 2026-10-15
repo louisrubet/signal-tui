@@ -39,3 +39,8 @@ tempfile = "3.9"
 # Same patch as the presage workspace: presage-store-sqlite needs this libsqlite3-sys fork for SQLCipher.
 [patch.crates-io]
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
+
+# Fork of whisperfish/libsignal-service-rs at presage's revision, with the first keepalive
+# delayed: Signal-Server closes sockets that send one before the device is present.
+[patch."https://github.com/whisperfish/libsignal-service-rs"]
+libsignal-service = { git = "https://github.com/louisrubet/libsignal-service-rs", rev = "7e455b6e2955e7aa611bedfd127fcc41c2ad09c4" }
