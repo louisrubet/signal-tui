@@ -96,3 +96,7 @@ cargo run --example mock_tui      # the UI with fake chats, no Signal (`-- --ope
 cargo run --example link_device   # link, then print chats as text
 cargo test                        # add `-- --ignored` for the network test
 ```
+
+## License
+
+[AGPL-3.0-only](LICENSE), like [presage](https://github.com/whisperfish/presage) and [libsignal](https://github.com/signalapp/libsignal) it is built on.
