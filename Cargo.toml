@@ -7,7 +7,7 @@ build = "build.rs"
 
 [dependencies]
 # The interface, shared with google-messages-tui.
-chat-tui = { git = "https://github.com/louisrubet/chat-tui", tag = "v0.1.0" }
+chat-tui = { git = "https://github.com/louisrubet/chat-tui", tag = "v1.0.0" }
 chrono = "0.4"
 futures = "0.3"
 # Fork of whisperfish/presage, branch storage-groups: adds Manager::sync_groups_from_storage_service.
