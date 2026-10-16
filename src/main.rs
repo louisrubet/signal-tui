@@ -1,10 +1,10 @@
 //! signal-tui: a terminal Signal client, linked as a secondary device of your phone.
 //!
-//!   signal-tui [--reset | --version]
+//!   signal-tui [--reset | --uninstall | --version | --help]
 //!
 //! On the first run, scan the QR code from the phone (Settings > Linked devices). The store
 //! lives in `~/.local/share/signal-tui/` (or `$SIGNAL_TUI_DB`). `--reset` deletes it first,
-//! to link again from scratch.
+//! to link again from scratch. `--uninstall` deletes it, with the read marks and pins.
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -22,15 +22,42 @@ use presage::model::messages::Received;
 use presage_store_sqlite::SqliteStore;
 use signal_tui::signal::{self, Directory, SignalManager, Thread};
 
-const USAGE: &str = "usage: signal-tui [--reset | --version]";
+const USAGE: &str = "usage: signal-tui [--reset | --uninstall | --version | --help]";
+const HELP: &str = "\
+signal-tui: Signal in the terminal, linked as a secondary device of your phone.
+
+Options:
+  --reset      forget the link (store and its keyring key), then link again
+  --uninstall  delete the store, its keyring key, the read marks and pins
+  --version    print the release version
+  --help       show this help";
 const DEVICE_NAME: &str = "signal-tui";
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() == 2 && args[1] == "--version" {
-        println!("{}", env!("SIGNAL_TUI_VERSION"));
-        return;
-    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let reset = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] => false,
+        ["--reset"] => true,
+        ["--version"] => {
+            println!("{}", env!("SIGNAL_TUI_VERSION"));
+            return;
+        }
+        ["--help" | "-h"] => {
+            println!("{HELP}\n\n{USAGE}");
+            return;
+        }
+        ["--uninstall"] => {
+            if let Err(e) = uninstall() {
+                eprintln!("signal-tui: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        _ => {
+            eprintln!("signal-tui: unknown argument {:?}\n{USAGE}", args.join(" "));
+            std::process::exit(2);
+        }
+    };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -38,19 +65,47 @@ fn main() {
         .expect("cannot create the Tokio runtime");
     let local = tokio::task::LocalSet::new();
 
-    if let Err(e) = runtime.block_on(local.run_until(run())) {
+    if let Err(e) = runtime.block_on(local.run_until(run(reset))) {
         eprintln!("signal-tui: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<(), Box<dyn Error>> {
-    let reset = match std::env::args().nth(1).as_deref() {
-        None => false,
-        Some("--reset") => true,
-        Some(arg) => return Err(format!("unknown argument {arg:?}\n{USAGE}").into()),
-    };
+/// Removes what signal-tui left on this machine, after confirmation: the store, its key in the
+/// keyring, the read marks and pins, and their directory if nothing else is in it.
+fn uninstall() -> Result<(), Box<dyn Error>> {
+    let path = signal::default_store_path()?;
+    let db = path.to_str().ok_or("the store path is not valid UTF-8")?;
+    println!("This deletes, for good:");
+    println!("  - the store key in the keyring (service signal-tui)");
+    println!("  - {db} (account, messages), with its read marks and pins");
+    print!("Continue? [y/N] ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        println!("Nothing removed.");
+        return Ok(());
+    }
+    signal::remove_store(db)?;
+    for file in [path.with_extension("read"), path.with_extension("pinned")] {
+        match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
+    // Only if empty: with $SIGNAL_TUI_DB, the directory may hold other files.
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    println!(
+        "Removed. Also remove the \"{DEVICE_NAME}\" device from the phone (Settings > Linked devices),"
+    );
+    println!("and the program with `cargo uninstall signal-tui`.");
+    Ok(())
+}
 
+async fn run(reset: bool) -> Result<(), Box<dyn Error>> {
     let path = signal::default_store_path()?;
     let db = path.to_str().ok_or("the store path is not valid UTF-8")?;
     if reset {

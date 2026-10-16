@@ -34,7 +34,16 @@ First run: scan the QR code from your phone (*Settings > Linked devices*).
 
 `signal-tui --reset` forgets the link and starts over. Also remove the old device from your phone.
 
-`signal-tui --version` prints the release version. On an exact tag it prints the tag, for example `v1.0.0`; after the latest tag it prints `<tag>+<5-char-sha>`.
+`signal-tui --version` prints the release version. On an exact tag it prints the tag, for example `v1.0.0`; after the latest tag it prints `<tag>+<5-char-sha>`. `signal-tui --help` lists the options.
+
+## Uninstall
+
+```sh
+signal-tui --uninstall        # store key in the keyring, ~/.local/share/signal-tui
+cargo uninstall signal-tui    # the program
+```
+
+`--uninstall` asks for confirmation. Also remove the device from your phone (*Settings > Linked devices*).
 
 ## Terminal
 
@@ -88,6 +97,7 @@ The store holds everything this linked device needs: its identity keys and crede
 - **No keyring** (headless Linux, SSH): a passphrase is asked at startup instead, or taken from `SIGNAL_TUI_PASSPHRASE`.
 - **Files** are created readable by you only (Unix).
 - **Reset**: `signal-tui --reset` deletes the store and its keyring key, then links again. Also remove the old device from your phone (*Settings > Linked devices*): that is what revokes it. Losing the key means resetting.
+- **Uninstall**: `signal-tui --uninstall` deletes the store, its keyring key, the read marks and pins.
 - **Limits**: a program running in your session can read the unlocked keyring. Full disk encryption protects the rest of your machine.
 
 ## Dev
