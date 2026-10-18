@@ -4,15 +4,11 @@ Running `signal` from your terminal.
 
 A Signal client for the terminal, linked to your phone as a secondary device (like Signal Desktop). Built on [presage](https://github.com/whisperfish/presage) and [chat-tui](https://github.com/louisrubet/chat-tui), the interface it shares with google-messages-tui.
 
-![A chat with photos, link previews, emojis and reactions](docs/screenshots/chat.png)
-
 - **Images** shown as thumbnails, pasted with `Ctrl+V`, opened full size with `o`
 - **Link previews** with title, description and image, as Signal sends them
 - **Emojis**: reactions, fuzzy `:shortcode` picker (fzf style)
 - **Replies, forwards, deletion**, `**bold**` `*italic*` `~strikethrough~`
 - **Pinned chats**, unread counts, desktop notifications
-
-<sub>Photos: Wikimedia Commons, CC BY-SA, credits in [chat-tui](https://github.com/louisrubet/chat-tui/blob/main/examples/demo/README.md).</sub>
 
 ## Install
 
