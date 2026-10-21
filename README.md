@@ -69,7 +69,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `Ctrl+V` | paste the image in the clipboard |
 | `Del` | delete your message for everyone (within 24 h) |
 | `/` | find chats by name and messages by text, ignoring case and accents (from the chat list); `Enter` goes to the results, where `Enter` opens the one selected, `Space` and `P` act on the chats found and `/` types again; `Esc` goes back |
-| `Space` | mark / unmark the selected chat, then go to the next one (`Esc` unmarks all) |
+| `Space` | mark / unmark the selected chat (`Esc` unmarks all) |
 | `P` | pin / unpin the selected chat, or the marked ones |
 | `Shift+↑` `Shift+↓` | move the selected pinned chat up / down among the pinned ones (or `Alt+↑` `Alt+↓`) |
 | `p` | parameters (from the chat list) |
