@@ -144,6 +144,7 @@ async fn chat(store: SqliteStore, path: &Path) -> Result<(), Box<dyn Error>> {
     let events = receive(manager.clone(), directory, known);
     // The read marks and pins stay next to the store, where earlier versions kept them.
     let mut config = chat_tui::Config::new(DEVICE_NAME)?;
+    config.version = env!("SIGNAL_TUI_VERSION").to_string();
     config.read_marks = path.with_extension("read");
     config.pins = path.with_extension("pinned");
     chat_tui::run(Signal { manager }, discussions, events, config).await?;
@@ -161,6 +162,8 @@ impl Backend for Signal {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             delete_max_age: Some(Duration::from_millis(signal::DELETE_MAX_AGE_MS)),
+            // Archiving and deleting chats: not implemented.
+            chat_actions: false,
         }
     }
 
