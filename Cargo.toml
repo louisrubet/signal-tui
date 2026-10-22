@@ -10,9 +10,9 @@ build = "build.rs"
 chat-tui = { git = "https://github.com/louisrubet/chat-tui", tag = "v1.8.1" }
 chrono = "0.4"
 futures = "0.3"
-# Fork of whisperfish/presage, branch sync-groups-from-storage-service: adds Manager::sync_groups_from_storage_service.
-presage = { git = "https://github.com/louisrubet/presage", rev = "a37a9a95c77d2f51357a2a5c67224356d82f2a6c" }
-presage-store-sqlite = { git = "https://github.com/louisrubet/presage", rev = "a37a9a95c77d2f51357a2a5c67224356d82f2a6c" }
+# Fork of whisperfish/presage, branch sync-groups-from-storage-service: fetches the groups from the Storage Service when linking.
+presage = { git = "https://github.com/louisrubet/presage", rev = "43c856528b145aeeac91c801edafd86888f1843e" }
+presage-store-sqlite = { git = "https://github.com/louisrubet/presage", rev = "43c856528b145aeeac91c801edafd86888f1843e" }
 tokio = { version = "1.48", features = ["macros", "rt", "time"] }
 url = "2.5"
 # Store encryption: key in the OS keyring, passphrase prompt as a fallback.

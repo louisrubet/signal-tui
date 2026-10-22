@@ -158,8 +158,8 @@ pub struct Conversation {
     pub last_message: Option<(DateTime<Local>, String)>,
 }
 
-/// Fetches what is waiting on the server (messages, contacts) and the groups listed in the
-/// Storage Service into the store.
+/// Fetches what is waiting on the server (messages, contacts) into the store. The groups
+/// listed in the Storage Service are fetched when linking.
 ///
 /// Also asks the phone for a contacts sync and waits up to `contacts_timeout` after the
 /// queue is drained for it to arrive. Returns the conversations seen in received messages,
@@ -173,38 +173,32 @@ pub async fn sync(
 
     manager.request_contacts().await?;
     let mut seen = HashSet::new();
-    // Scoped so the receiving connection closes before the groups are fetched.
-    {
-        let mut messages = pin!(manager.receive_messages().await?);
-        let mut contacts_deadline: Option<Instant> = None;
-        let mut got_contacts = false;
+    let mut messages = pin!(manager.receive_messages().await?);
+    let mut contacts_deadline: Option<Instant> = None;
+    let mut got_contacts = false;
 
-        loop {
-            let wait = match contacts_deadline {
-                Some(_) if got_contacts => break,
-                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
-                None => IDLE_TIMEOUT,
-            };
-            let Ok(Some(received)) = tokio::time::timeout(wait, messages.next()).await else {
-                break;
-            };
-            match received {
-                Received::QueueEmpty => {
-                    contacts_deadline.get_or_insert(Instant::now() + contacts_timeout);
-                }
-                Received::Contacts => got_contacts = true,
-                Received::Content(content) => {
-                    if let Ok(thread) = Thread::try_from(&*content) {
-                        seen.insert(thread);
-                    }
-                }
-                _ => {}
+    loop {
+        let wait = match contacts_deadline {
+            Some(_) if got_contacts => break,
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            None => IDLE_TIMEOUT,
+        };
+        let Ok(Some(received)) = tokio::time::timeout(wait, messages.next()).await else {
+            break;
+        };
+        match received {
+            Received::QueueEmpty => {
+                contacts_deadline.get_or_insert(Instant::now() + contacts_timeout);
             }
+            Received::Contacts => got_contacts = true,
+            Received::Content(content) => {
+                if let Ok(thread) = Thread::try_from(&*content) {
+                    seen.insert(thread);
+                }
+            }
+            _ => {}
         }
     }
-
-    // Groups are not part of the contacts sync: the Storage Service lists them.
-    manager.sync_groups_from_storage_service().await?;
     Ok(seen)
 }
 

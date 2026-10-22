@@ -84,7 +84,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 - **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.
 - **Store**: `~/.local/share/signal-tui/`, override with `SIGNAL_TUI_DB`. See [Security](#security).
 - **Interface**: [chat-tui](https://github.com/louisrubet/chat-tui), pinned by tag in `Cargo.toml`; its demo with fake chats is `cargo run --example mock_tui` there.
-- **presage fork**: [louisrubet/presage](https://github.com/louisrubet/presage/tree/sync-groups-from-storage-service) adds group sync from the Storage Service.
+- **presage fork**: [louisrubet/presage](https://github.com/louisrubet/presage/tree/sync-groups-from-storage-service) fetches the groups from the Storage Service when linking.
 
 ## Security
 
