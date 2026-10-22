@@ -284,11 +284,7 @@ fn receive(
                 } else if let Some((mut message, quote)) = directory.to_message(&content) {
                     if known.insert(chat.clone()) {
                         // A conversation not listed yet (e.g. someone not in the contacts).
-                        let title = signal::thread_title(&other, &thread)
-                            .await
-                            .unwrap_or_else(|_| thread.to_string());
-                        let mut discussion = Discussion::new(chat.clone(), title);
-                        discussion.is_group = matches!(thread, Thread::Group(_));
+                        let discussion = new_discussion(&other, &thread, chat.clone()).await;
                         let _ = events.unbounded_send(Event::Chat(discussion));
                     }
                     // Images only: videos and files can be big, they wait for `o`.
@@ -305,6 +301,9 @@ fn receive(
                         message,
                         quote: quote.map(|id| id.to_string()),
                     }
+                } else if signal::is_group_update(&content) && known.insert(chat.clone()) {
+                    // A group just created or joined: its update has no text to show.
+                    Event::Chat(new_discussion(&other, &thread, chat).await)
                 } else {
                     continue;
                 }
@@ -315,4 +314,14 @@ fn receive(
         }
     });
     received
+}
+
+/// A chat to list for `thread`, which has none yet.
+async fn new_discussion(manager: &SignalManager, thread: &Thread, chat: ChatId) -> Discussion {
+    let title = signal::thread_title(manager, thread)
+        .await
+        .unwrap_or_else(|_| thread.to_string());
+    let mut discussion = Discussion::new(chat, title);
+    discussion.is_group = matches!(thread, Thread::Group(_));
+    discussion
 }

@@ -289,6 +289,14 @@ fn data_message(content: &Content) -> Option<(&DataMessage, bool)> {
     }
 }
 
+/// Whether `content` is a message of a group carrying no text nor attachment, like the
+/// update sent when a group is created or someone is added.
+pub fn is_group_update(content: &Content) -> bool {
+    data_message(content).is_some_and(|(data, _)| {
+        data.group_v2.is_some() && data.body.is_none() && data.attachments.is_empty()
+    })
+}
+
 /// Display name of a conversation: group title, contact name or phone number, and
 /// "Note to Self" for the conversation with our own account.
 pub async fn thread_title(
@@ -839,6 +847,7 @@ async fn send_data_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use presage::libsignal_service::content::Metadata;
 
     #[test]
     fn body_ranges_count_utf16_units() {
@@ -852,5 +861,42 @@ mod tests {
         let ranges = to_body_ranges(text, &styles);
         assert_eq!((ranges[0].start, ranges[0].length), (Some(4), Some(4)));
         assert_eq!(from_body_ranges(text, &ranges), styles);
+    }
+
+    #[test]
+    fn group_updates_have_no_text() {
+        let content = |data: DataMessage| {
+            let me = ServiceId::Aci(Uuid::nil().into());
+            let metadata = Metadata {
+                sender: me,
+                destination: me,
+                sender_device: 1.try_into().unwrap(),
+                pni_verified: None,
+                client_timestamp: Utc::now(),
+                server_timestamp: Utc::now(),
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+            };
+            Content::from_body(data, metadata)
+        };
+        let group = Some(GroupContextV2 {
+            master_key: Some(vec![0; 32]),
+            revision: Some(0),
+            ..Default::default()
+        });
+        let update = DataMessage {
+            group_v2: group.clone(),
+            ..Default::default()
+        };
+        let text = DataMessage {
+            body: Some("hi".to_string()),
+            group_v2: group,
+            ..Default::default()
+        };
+        assert!(is_group_update(&content(update)));
+        assert!(!is_group_update(&content(text)));
+        assert!(!is_group_update(&content(DataMessage::default())));
     }
 }
