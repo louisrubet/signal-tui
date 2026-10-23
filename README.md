@@ -65,6 +65,8 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `e` | react to the selected message (`1`–`6` or a `:shortcode:`) |
 | `f` | forward the selected message |
 | `c` | copy the selected message (OSC 52) |
+| `c` | on a message being sent ("Sending…"): cancel it (it may have left already) |
+| `s` | on a message not sent (⚠ Not sent, in red): send it again |
 | `o` | open the links and images of the selected message |
 | `Ctrl+V` | paste the image in the clipboard |
 | `Del` | delete your message for everyone (within 24 h) |
@@ -73,7 +75,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `P` | pin / unpin the selected chat, or the marked ones |
 | `Shift+↑` `Shift+↓` | move the selected pinned chat up / down among the pinned ones (or `Alt+↑` `Alt+↓`) |
 | `p` | parameters (from the chat list) |
-| `Esc` | unselect, back |
+| `Esc` | unselect, back (a message being sent goes on) |
 | `q` | quit |
 
 ## Good to know

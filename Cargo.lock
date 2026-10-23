@@ -532,9 +532,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "chat-tui"
-version = "1.8.1"
-source = "git+https://github.com/louisrubet/chat-tui-core?tag=v1.8.1#013efb15adae7144b04aaf8df425c17a9aba71c8"
+name = "chat-tui-core"
+version = "1.11.1"
+source = "git+https://github.com/louisrubet/chat-tui-core?tag=v1.11.1#8d3c259faf09d54128a2548d40fcef57455f052e"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -1040,8 +1040,8 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "emoji-expander"
-version = "1.2.0"
-source = "git+https://github.com/louisrubet/emoji-expander?tag=v1.2.0#edb9cf2230dd00e4407d188884374b5496dc7047"
+version = "1.2.1"
+source = "git+https://github.com/louisrubet/emoji-expander?tag=v1.2.1#545cb53917ed28b9663ec8014cdbdd49b8f88a84"
 dependencies = [
  "lazy_static",
 ]
@@ -3779,7 +3779,7 @@ dependencies = [
 name = "signal-tui"
 version = "1.4.0"
 dependencies = [
- "chat-tui",
+ "chat-tui-core",
  "chrono",
  "futures",
  "keyring",

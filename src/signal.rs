@@ -498,6 +498,8 @@ impl Directory {
                 })
                 .collect(),
             download_failed: false,
+            failed: false,
+            sending: false,
         };
         Some((message, data.quote.as_ref().and_then(|q| q.id)))
     }

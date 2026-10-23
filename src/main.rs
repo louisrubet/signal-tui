@@ -162,8 +162,10 @@ impl Backend for Signal {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             delete_max_age: Some(Duration::from_millis(signal::DELETE_MAX_AGE_MS)),
-            // Archiving and deleting chats: not implemented.
+            // Deleting for oneself, chat actions, new chats: not implemented.
+            delete_for_me: false,
             chat_actions: false,
+            new_chat: false,
         }
     }
 
