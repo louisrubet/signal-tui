@@ -2,7 +2,7 @@
 
 Running `signal` from your terminal.
 
-A Signal client for the terminal, linked to your phone as a secondary device (like Signal Desktop). Built on [presage](https://github.com/whisperfish/presage) and [chat-tui](https://github.com/louisrubet/chat-tui), the interface it shares with google-messages-tui.
+A Signal client for the terminal, linked to your phone as a secondary device (like Signal Desktop). Built on [presage](https://github.com/whisperfish/presage) and [chat-tui-core](https://github.com/louisrubet/chat-tui-core), the interface it shares with [gmessages-tui](https://github.com/louisrubet/gmessages-tui).
 
 - **Images** shown as thumbnails, pasted with `Ctrl+V`, opened full size with `o`
 - **Link previews** with title, description and image, as Signal sends them
@@ -83,7 +83,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 - **No history.** Signal doesn't send past messages to linked devices. You only see messages received since linking.
 - **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.
 - **Store**: `~/.local/share/signal-tui/`, override with `SIGNAL_TUI_DB`. See [Security](#security).
-- **Interface**: [chat-tui](https://github.com/louisrubet/chat-tui), pinned by tag in `Cargo.toml`; its demo with fake chats is `cargo run --example mock_tui` there.
+- **Interface**: [chat-tui-core](https://github.com/louisrubet/chat-tui-core), pinned by tag in `Cargo.toml`; its demo with fake chats is `cargo run --example mock_tui` there.
 - **presage**: pinned on [whisperfish/presage#469](https://github.com/whisperfish/presage/pull/469), not merged yet, which fetches the groups from the Storage Service when linking.
 
 ## Security

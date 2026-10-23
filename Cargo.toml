@@ -7,7 +7,7 @@ build = "build.rs"
 
 [dependencies]
 # The interface, shared with google-messages-tui.
-chat-tui = { git = "https://github.com/louisrubet/chat-tui", tag = "v1.8.1" }
+chat-tui = { git = "https://github.com/louisrubet/chat-tui-core", tag = "v1.8.1" }
 chrono = "0.4"
 futures = "0.3"
 # whisperfish/presage, PR #469 (not merged yet): fetches the groups from the Storage Service when linking.

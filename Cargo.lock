@@ -534,7 +534,7 @@ dependencies = [
 [[package]]
 name = "chat-tui"
 version = "1.8.1"
-source = "git+https://github.com/louisrubet/chat-tui?tag=v1.8.1#013efb15adae7144b04aaf8df425c17a9aba71c8"
+source = "git+https://github.com/louisrubet/chat-tui-core?tag=v1.8.1#013efb15adae7144b04aaf8df425c17a9aba71c8"
 dependencies = [
  "arboard",
  "base64 0.22.1",
