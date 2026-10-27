@@ -86,7 +86,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 - **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.
 - **Store**: `~/.local/share/signal-tui/`, override with `SIGNAL_TUI_DB`. See [Security](#security).
 - **Interface**: [chat-tui-core](https://github.com/louisrubet/chat-tui-core), pinned by tag in `Cargo.toml`; its demo with fake chats is `cargo run --example mock_tui` there.
-- **presage**: pinned on [whisperfish/presage#469](https://github.com/whisperfish/presage/pull/469), not merged yet, which fetches the groups from the Storage Service when linking.
+- **presage**: pinned on a commit of [whisperfish/presage](https://github.com/whisperfish/presage) `main`, not released yet, for the groups fetched from the Storage Service.
 
 ## Security
 
