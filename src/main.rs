@@ -17,7 +17,7 @@ use chat_tui::backend::Result as BackendResult;
 use chat_tui::data::{ChatId, Discussion, Message};
 use chat_tui::{Backend, Capabilities, Downloaded, Draft, Event, qr};
 use futures::StreamExt;
-use futures::channel::mpsc::{UnboundedReceiver, unbounded};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use presage::model::messages::Received;
 use presage_store_sqlite::SqliteStore;
 use signal_tui::signal::{self, Directory, SignalManager, Thread};
@@ -234,88 +234,120 @@ impl Backend for Signal {
 }
 
 /// What arrives from Signal while the interface runs, as interface events. `known`: the
-/// chats already listed. Ends when the connection is lost.
+/// chats already listed. A lost connection is said in the footer and opened again: the
+/// server keeps the messages meanwhile.
 fn receive(
     mut manager: SignalManager,
     directory: Directory,
     mut known: HashSet<ChatId>,
 ) -> UnboundedReceiver<Event> {
+    // Between attempts to reconnect: doubled from the first up to the last.
+    const RETRY_FIRST: Duration = Duration::from_secs(2);
+    const RETRY_LAST: Duration = Duration::from_secs(60);
+
     let (events, received) = unbounded();
     // Receiving borrows `manager`: downloads and titles go through clones.
     let other = manager.clone();
     tokio::task::spawn_local(async move {
-        let incoming = match manager.receive_messages().await {
-            Ok(incoming) => incoming,
-            Err(e) => {
-                let _ =
-                    events.unbounded_send(Event::Status(format!("Cannot receive messages: {e}")));
-                return;
-            }
-        };
-        let mut incoming = pin!(incoming);
-        while let Some(received) = incoming.next().await {
-            let Received::Content(content) = received else {
-                continue;
-            };
-            let event = if let Some(typing) = directory.typing(&content) {
-                Event::Typing {
-                    chat: signal::thread_key(&typing.thread),
-                    author: typing.author,
-                    name: typing.name,
-                    started: typing.started,
-                }
-            } else {
-                let Ok(thread) = Thread::try_from(&*content) else {
-                    continue;
-                };
-                let chat = signal::thread_key(&thread);
-                if let Some((target, author)) = directory.deletion(&content) {
-                    Event::Deleted {
-                        chat,
-                        target: target.to_string(),
-                        author,
-                    }
-                } else if let Some(reaction) = directory.reaction(&content) {
-                    Event::Reaction {
-                        chat,
-                        target: reaction.target_id.to_string(),
-                        author: reaction.author,
-                        mine: reaction.mine,
-                        emoji: reaction.emoji,
-                    }
-                } else if let Some((mut message, quote)) = directory.to_message(&content) {
-                    if known.insert(chat.clone()) {
-                        // A conversation not listed yet (e.g. someone not in the contacts).
-                        let discussion = new_discussion(&other, &thread, chat.clone()).await;
-                        let _ = events.unbounded_send(Event::Chat(discussion));
-                    }
-                    // Images only: videos and files can be big, they wait for `o`.
-                    if message.needs_download() && message.images_only() {
-                        match signal::download_content_attachments(&other, &content).await {
-                            Ok((attachments, images)) => {
-                                message.set_downloaded(attachments, images)
-                            }
-                            Err(_) => message.download_failed = true,
+        let mut retry = RETRY_FIRST;
+        let mut lost = false;
+        loop {
+            let reason = match manager.receive_messages().await {
+                Ok(incoming) => {
+                    if lost {
+                        let status = Event::Status("Reconnected to Signal".to_string());
+                        if events.unbounded_send(status).is_err() {
+                            return;
                         }
                     }
-                    Event::Message {
-                        chat,
-                        message,
-                        quote: quote.map(|id| id.to_string()),
+                    let mut incoming = pin!(incoming);
+                    while let Some(received) = incoming.next().await {
+                        retry = RETRY_FIRST;
+                        if let Some(event) =
+                            to_event(&other, &directory, &mut known, &events, received).await
+                            && events.unbounded_send(event).is_err()
+                        {
+                            return;
+                        }
                     }
-                } else if signal::is_group_update(&content) && known.insert(chat.clone()) {
-                    // A group just created or joined: its update has no text to show.
-                    Event::Chat(new_discussion(&other, &thread, chat).await)
-                } else {
-                    continue;
+                    "connection lost".to_string()
                 }
+                Err(e) => e.to_string(),
             };
-            if events.unbounded_send(event).is_err() {
-                break;
+            lost = true;
+            let status = format!("Signal: {reason}, retrying in {} s", retry.as_secs());
+            if events.unbounded_send(Event::Status(status)).is_err() {
+                return;
             }
+            tokio::time::sleep(retry).await;
+            retry = (retry * 2).min(RETRY_LAST);
         }
     });
     received
+}
+
+/// The interface event for `received`, if any. Announces the chats not `known` yet.
+async fn to_event(
+    other: &SignalManager,
+    directory: &Directory,
+    known: &mut HashSet<ChatId>,
+    events: &UnboundedSender<Event>,
+    received: Received,
+) -> Option<Event> {
+    let Received::Content(content) = received else {
+        return None;
+    };
+    Some(if let Some(typing) = directory.typing(&content) {
+        Event::Typing {
+            chat: signal::thread_key(&typing.thread),
+            author: typing.author,
+            name: typing.name,
+            started: typing.started,
+        }
+    } else {
+        let Ok(thread) = Thread::try_from(&*content) else {
+            return None;
+        };
+        let chat = signal::thread_key(&thread);
+        if let Some((target, author)) = directory.deletion(&content) {
+            Event::Deleted {
+                chat,
+                target: target.to_string(),
+                author,
+            }
+        } else if let Some(reaction) = directory.reaction(&content) {
+            Event::Reaction {
+                chat,
+                target: reaction.target_id.to_string(),
+                author: reaction.author,
+                mine: reaction.mine,
+                emoji: reaction.emoji,
+            }
+        } else if let Some((mut message, quote)) = directory.to_message(&content) {
+            if known.insert(chat.clone()) {
+                // A conversation not listed yet (e.g. someone not in the contacts).
+                let discussion = new_discussion(other, &thread, chat.clone()).await;
+                let _ = events.unbounded_send(Event::Chat(discussion));
+            }
+            // Images only: videos and files can be big, they wait for `o`.
+            if message.needs_download() && message.images_only() {
+                match signal::download_content_attachments(other, &content).await {
+                    Ok((attachments, images)) => message.set_downloaded(attachments, images),
+                    Err(_) => message.download_failed = true,
+                }
+            }
+            Event::Message {
+                chat,
+                message,
+                quote: quote.map(|id| id.to_string()),
+            }
+        } else if signal::is_group_update(&content) && known.insert(chat.clone()) {
+            // A group just created or joined: its update has no text to show.
+            Event::Chat(new_discussion(other, &thread, chat).await)
+        } else {
+            return None;
+        }
+    })
 }
 
 /// A chat to list for `thread`, which has none yet.
