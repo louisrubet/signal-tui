@@ -7,7 +7,7 @@ build = "build.rs"
 
 [dependencies]
 # The interface, shared with google-messages-tui.
-chat-tui = { package = "chat-tui-core", git = "https://github.com/louisrubet/chat-tui-core", tag = "v1.11.3" }
+chat-tui = { package = "chat-tui-core", git = "https://github.com/louisrubet/chat-tui-core", tag = "v1.11.4" }
 chrono = "0.4"
 futures = "0.3"
 # whisperfish/presage main, for the groups fetched from the Storage Service (#469), not released yet.
