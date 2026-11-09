@@ -8,7 +8,7 @@ A Signal client for the terminal, linked to your phone as a secondary device (li
 - **Link previews** with title, description and image, as Signal sends them
 - **Emojis**: reactions, fuzzy `:shortcode` picker (fzf style)
 - **Replies, forwards, deletion**, `**bold**` `*italic*` `~strikethrough~`
-- **Pinned chats**, unread counts, desktop notifications
+- **Pinned chats**, unread counts shared with your other devices, desktop notifications
 
 ## Install
 

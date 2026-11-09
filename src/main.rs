@@ -6,7 +6,8 @@
 //! lives in `~/.local/share/signal-tui/` (or `$SIGNAL_TUI_DB`). `--reset` deletes it first,
 //! to link again from scratch. `--uninstall` deletes it, with the read marks and pins.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::future::Future;
 use std::path::Path;
@@ -14,7 +15,7 @@ use std::pin::pin;
 use std::time::Duration;
 
 use chat_tui::backend::Result as BackendResult;
-use chat_tui::data::{ChatId, Discussion, Message};
+use chat_tui::data::{ChatId, Discussion, Message, MessageId};
 use chat_tui::{Backend, Capabilities, Downloaded, Draft, Event, qr};
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -147,13 +148,19 @@ async fn chat(store: SqliteStore, path: &Path) -> Result<(), Box<dyn Error>> {
     config.version = env!("SIGNAL_TUI_VERSION").to_string();
     config.read_marks = path.with_extension("read");
     config.pins = path.with_extension("pinned");
-    chat_tui::run(Signal { manager }, discussions, events, config).await?;
+    let signal = Signal {
+        manager,
+        read: RefCell::default(),
+    };
+    chat_tui::run(signal, discussions, events, config).await?;
     Ok(())
 }
 
 /// Signal, for the interface.
 struct Signal {
     manager: SignalManager,
+    /// The last message said read to our other devices, by chat.
+    read: RefCell<HashMap<ChatId, MessageId>>,
 }
 
 /// The futures own a clone of the manager: they are `'static`, as the trait wants.
@@ -217,6 +224,19 @@ impl Backend for Signal {
             let thread = thread.ok_or("unknown chat")?;
             Ok(signal::delete(&mut manager, &thread, &message).await?)
         }
+    }
+
+    /// Said to our other devices, once per last message received.
+    fn read(&self, chat: &ChatId, last: &Message) {
+        if last.from_me || self.read.borrow().get(chat) == Some(&last.id) {
+            return;
+        }
+        self.read.borrow_mut().insert(chat.clone(), last.id.clone());
+        let (mut manager, last) = (self.manager.clone(), last.clone());
+        // Best effort: the chat stays read here anyway.
+        tokio::task::spawn_local(async move {
+            let _ = signal::mark_read(&mut manager, &last).await;
+        });
     }
 
     fn download(
@@ -297,6 +317,14 @@ async fn to_event(
     let Received::Content(content) = received else {
         return None;
     };
+    let read = directory.read_elsewhere(other.store(), &content).await;
+    if !read.is_empty() {
+        for thread in read {
+            let chat = signal::thread_key(&thread);
+            let _ = events.unbounded_send(Event::Read { chat });
+        }
+        return None;
+    }
     Some(if let Some(typing) = directory.typing(&content) {
         Event::Typing {
             chat: signal::thread_key(&typing.thread),

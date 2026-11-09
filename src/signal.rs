@@ -24,7 +24,7 @@ use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage::proto::body_range::{AssociatedValue, Style as BodyStyle};
 use presage::proto::data_message::{Delete, Quote, Reaction};
-use presage::proto::sync_message::{Content as SyncContent, Sent};
+use presage::proto::sync_message::{Content as SyncContent, Read, Sent};
 use presage::proto::typing_message::Action as TypingAction;
 use presage::proto::{BodyRange, DataMessage, GroupContextV2, SyncMessage};
 use presage::store::ContentsStore;
@@ -426,6 +426,48 @@ impl Directory {
         Some((target, author.to_string()))
     }
 
+    /// The chats read on our other devices, from the read sync `content` (none for
+    /// anything else): those whose last message received was read there.
+    pub async fn read_elsewhere(&self, store: &SqliteStore, content: &Content) -> Vec<Thread> {
+        let ContentBody::SynchronizeMessage(sync) = &content.body else {
+            return Vec::new();
+        };
+        if content.metadata.sender.raw_uuid() != self.own_aci {
+            return Vec::new();
+        }
+        let mut threads = Vec::new();
+        for read in &sync.read {
+            let sender = read
+                .sender_aci_binary
+                .as_deref()
+                .and_then(|bytes| Uuid::from_slice(bytes).ok())
+                .or_else(|| read.sender_aci.as_deref()?.parse().ok());
+            let (Some(sender), Some(timestamp)) = (sender, read.timestamp) else {
+                continue;
+            };
+            let sender = ServiceId::Aci(sender.into());
+            let Ok(Some(thread)) = store
+                .thread_for_sender_and_timestamp(&sender, timestamp)
+                .await
+            else {
+                continue;
+            };
+            if threads.contains(&thread) {
+                continue;
+            }
+            let Ok(later) = store.messages(&thread, timestamp + 1..).await else {
+                continue;
+            };
+            let received_after = later
+                .flatten()
+                .any(|later| self.to_message(&later).is_some_and(|(m, _)| !m.from_me));
+            if !received_after {
+                threads.push(thread);
+            }
+        }
+        threads
+    }
+
     /// The typing notification in `content`, if any (ours from other devices are ignored).
     pub fn typing(&self, content: &Content) -> Option<Typing> {
         let ContentBody::TypingMessage(typing) = &content.body else {
@@ -813,6 +855,31 @@ pub async fn delete(
     send_data_message(manager, thread, message, timestamp).await
 }
 
+/// Tells our other devices that `message`, received, and those before it in its chat are
+/// read. Not a read receipt: its sender is not told.
+pub async fn mark_read(manager: &mut SignalManager, message: &Message) -> Result<(), SignalError> {
+    let Some(sender) = message
+        .author
+        .as_deref()
+        .and_then(|a| a.parse::<Uuid>().ok())
+    else {
+        return Ok(());
+    };
+    let sync = SyncMessage {
+        read: vec![Read {
+            sender_aci: Some(sender.to_string()),
+            sender_aci_binary: Some(sender.as_bytes().to_vec()),
+            timestamp: Some(signal_id(message)),
+        }],
+        ..Default::default()
+    };
+    let own = manager.registration_data().service_ids.aci;
+    let timestamp = Utc::now().timestamp_millis() as u64;
+    manager
+        .send_message(ServiceId::Aci(own.into()), sync, timestamp)
+        .await
+}
+
 /// Our ACI, as in [`Message::author`].
 fn own_aci(manager: &SignalManager) -> String {
     manager.registration_data().service_ids.aci.to_string()
@@ -900,5 +967,80 @@ mod tests {
         assert!(is_group_update(&content(update)));
         assert!(!is_group_update(&content(text)));
         assert!(!is_group_update(&content(DataMessage::default())));
+    }
+
+    #[test]
+    fn chats_read_elsewhere_up_to_their_last_message() {
+        let (me, alice) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        // Stored by the envelope timestamp, the message's own for those received.
+        let content = |sender: Uuid, timestamp: i64, body: ContentBody| {
+            let at = DateTime::from_timestamp_millis(timestamp).unwrap();
+            let metadata = Metadata {
+                sender: ServiceId::Aci(sender.into()),
+                destination: ServiceId::Aci(me.into()),
+                sender_device: 1.try_into().unwrap(),
+                pni_verified: None,
+                client_timestamp: at,
+                server_timestamp: at,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+            };
+            Content::from_body(body, metadata)
+        };
+        let text = |timestamp: u64| {
+            ContentBody::DataMessage(DataMessage {
+                body: Some("hi".to_string()),
+                timestamp: Some(timestamp),
+                ..Default::default()
+            })
+        };
+        let read = |timestamp: u64| {
+            ContentBody::SynchronizeMessage(SyncMessage {
+                read: vec![Read {
+                    sender_aci_binary: Some(alice.as_bytes().to_vec()),
+                    timestamp: Some(timestamp),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        let directory = Directory {
+            own_aci: me,
+            names: HashMap::new(),
+            groups: HashMap::new(),
+        };
+        let thread = Thread::Contact(ServiceId::Aci(alice.into()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = open_store(path.to_str().unwrap(), None).await.unwrap();
+            store
+                .save_message(&thread, content(alice, 100, text(100)))
+                .await
+                .unwrap();
+            let read_100 = content(me, 300, read(100));
+            assert_eq!(
+                directory.read_elsewhere(&store, &read_100).await,
+                std::slice::from_ref(&thread)
+            );
+            // Only from our devices.
+            let forged = content(alice, 300, read(100));
+            assert!(directory.read_elsewhere(&store, &forged).await.is_empty());
+            // Unknown message.
+            let unknown = content(me, 300, read(150));
+            assert!(directory.read_elsewhere(&store, &unknown).await.is_empty());
+            // A message received after the one read there: still new here.
+            store
+                .save_message(&thread, content(alice, 200, text(200)))
+                .await
+                .unwrap();
+            assert!(directory.read_elsewhere(&store, &read_100).await.is_empty());
+        });
     }
 }
